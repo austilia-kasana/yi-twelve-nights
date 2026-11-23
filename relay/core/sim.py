@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import ast
+import itertools
 import math
 import random
 from typing import Iterable, Optional
@@ -50,7 +52,8 @@ class GameState:
         self.rng = random.Random(seed)
 
         self.night = 1
-        self.faith = float(B.START_FAITH)
+        # 信用整数。早先是 float，和日志里的 int 差量对不上（见 advance 里的说明）。
+        self.faith = int(B.START_FAITH)
         self.gold = float(B.START_GOLD)
         self.oil = float(B.START_OIL)
 
@@ -201,13 +204,19 @@ class GameState:
         return 1.0 if self.oil >= B.NO_LIGHT_OIL_THRESHOLD else B.OIL_LIGHT_FACTOR
 
     def travel_nights(self, dispatch: Dispatch, rider: Rider, horse: Horse,
-                      weather: Optional[str] = None) -> int:
-        """用某骑手+某马送这封信，要跑几夜。"""
+                      weather: Optional[str] = None,
+                      light_factor: Optional[float] = None) -> int:
+        """用某骑手+某马送这封信，要跑几夜。
+
+        light_factor 显式传入时用它，否则读当前油量。
+        夜初算一次、整夜复用——见 advance() 里的说明。
+        """
         w = weather or self.weather or "clear"
         dist = self.route_distance[dispatch.route]
         wf = B.WEATHER[w]["route_factor"][dispatch.route]
+        light = self.current_light_factor() if light_factor is None else light_factor
         speed = (rider.effective_speed() * horse.effective_speed()
-                 * wf * self.current_light_factor() * B.BASE_TRAVEL)
+                 * wf * light * B.BASE_TRAVEL)
         if speed <= 0.01:
             return 99
         return max(1, int(math.ceil(dist / speed)))
@@ -228,16 +237,22 @@ class GameState:
         return _weighted_choice(self.rng, weights)
 
     # ────────────────────── 推进一夜 ──────────────────────
-    def advance(self, assignments: Iterable[tuple], resting: Iterable[str] = ()) -> NightResult:
+    def advance(self, assignments: Iterable[tuple],
+                resting: Iterable[str] = ()) -> NightResult:
         """推进一夜。
 
         assignments: [(dispatch, rider, horse), ...]
-        resting:     休息的骑手 id 集合（+体力）
+
+        resting 参数已废弃：现在自动推断——**本夜没被指派、也没受伤的骑手
+        就是歇着**。保留这个参数只是为了让旧调用不报错，传了也不生效。
+
+        早先必须由调用方显式传 resting，一旦 UI 或测试漏传，就会出现
+        「站着发呆一整晚却不回体力」。这种「调用方必须记得做某件事」的
+        设计迟早会出问题，所以改成规则内建。
         """
         if self.over:
             raise RuntimeError("本局已经结束")
 
-        resting = set(resting)
         assignments = list(assignments)
 
         # 用到的骑手/马不能重复
@@ -250,6 +265,18 @@ class GameState:
             used_r.add(r.id)
             used_h.add(h.id)
 
+        # 按信 id 排序后再结算。
+        #
+        # 这是「派遣顺序不影响结果」的第二层保障。第一层是灯系数在夜初定死，
+        # 但还有一层更隐蔽的：random 是按派单顺序逐个消耗的，
+        # `_roll_event()` 抽到顺风还是落石，取决于它是第几个被结算的。
+        # 于是「同样这封信、同样这个骑手」，点它在第一位还是第二位，
+        # 结果可能完全不同——而这同样不是玩家能控制的。
+        #
+        # 排序之后，随机数消耗顺序与点击顺序无关，结果完全确定。
+        # 附带好处：日志里同一夜的多封总是按固定顺序出现。
+        assignments.sort(key=lambda a: a[0].id)
+
         weather = self.weather or "clear"
         result = NightResult(
             night=self.night,
@@ -258,46 +285,74 @@ class GameState:
             forecast_was_right=(self.forecast == weather),
         )
 
+        # 灯的系数在夜初定死，整夜所有派单都用同一个值。
+        #
+        # 早先这里是每次算行进时现读 self.oil，而油又在同一夜里边派边扣。
+        # 结果：第一趟还看得见，第二趟就没灯了——「谁先派」直接决定了谁快谁慢。
+        # 实测同一个局面只换点击顺序：
+        #   顺序 A 老陈 2 夜 / 小满 4 夜
+        #   顺序 B 小满 2 夜 / 老陈 5 夜
+        # 而顺序取决于字典遍历顺序，玩家根本控制不了。这是纯粹的公平性 bug。
+        light = self.current_light_factor()
+
         # 拒收的信
         taken_ids = {d.id for d, _, _ in assignments}
         result.dropped = [d for d in self.dispatches if d.id not in taken_ids]
 
-        for d, r, h in assignments:
-            nights = self.travel_nights(d, r, h, weather)
+        injured_tonight: set[str] = set()
+        revoked_at: Optional[int] = None
+
+        for idx, (d, r, h) in enumerate(assignments):
+            # 信已归零 = 驿被撤了，剩下的派单不该再出去。
+            # 早先这里会把后面的信继续结算完——已经判定失败了还在扣资源、
+            # 还在让骑手受伤，日志里也照常记一笔。
+            if self.faith <= 0:
+                revoked_at = idx
+                break
+
+            nights = self.travel_nights(d, r, h, weather, light)
             event = self._roll_event(d, weather)
 
             delivered = False
             lost = False
-            note = ""
+            event_note = ""     # 顺风 / 迷路 / 落石 / 遇劫
+            outcome_note = ""   # 送到了 / 晚了 N 夜 / 没能送出去
 
             if event == "tailwind":
                 nights = max(1, nights - 1)
-                note = "顺风，快了一夜。"
+                event_note = "顺风，快了一夜。"
             elif event == "lost":
                 nights += 1
-                note = "迷路，慢了一夜。"
+                event_note = "迷路，慢了一夜。"
             elif event == "rockfall":
                 nights = 99
-                note = "落石，原路折返。"
+                event_note = "落石，原路折返。"
             elif event == "robbery":
                 lost = True
                 nights = 99
-                note = "遇劫，信没了。"
+                event_note = "遇劫，信没了。"
 
             if not lost:
                 delivered = (nights <= d.deadline)
                 if delivered:
                     self.gold += d.reward
-                    faith_gain = B.FAITH_PER_DELIVER * B.FAITH_DELIVER_MULT[d.kind]
-                    self.faith = _clamp(self.faith + faith_gain, 0, B.MAX_FAITH)
+                    # 信按整数累加。
+                    # 早先这里用浮点累加、日志里却用 int(round(...)) 记差量，
+                    # 两边会越走越远：实测 6 次送达就差了 2.4 点，
+                    # 复盘时「每一笔都对，加起来不等于总数」。
+                    gain = int(round(B.FAITH_PER_DELIVER
+                                     * B.FAITH_DELIVER_MULT[d.kind]))
+                    self.faith = _clamp(self.faith + gain, 0, B.MAX_FAITH)
                     result.gold_delta += d.reward
-                    result.faith_delta += int(round(faith_gain))
-                    note = note or "送到了。"
+                    result.faith_delta += gain
+                    outcome_note = "送到了。"
                 else:
                     self.faith = _clamp(self.faith - d.penalty, 0, B.MAX_FAITH)
                     result.faith_delta -= d.penalty
-                    if not note:
-                        note = "晚了一夜。" if nights < 99 else "没能送出去。"
+                    if nights >= 99:
+                        outcome_note = "没能送出去。"
+                    else:
+                        outcome_note = "晚了 %d 夜。" % (nights - d.deadline)
             else:
                 # 遇劫：信按「一半罚款」计。
                 # 早先这里是全额罚——八百里一次 -20 信，相当于总信量的 1/4，
@@ -306,6 +361,13 @@ class GameState:
                 rob_pen = max(1, d.penalty // 2)
                 self.faith = _clamp(self.faith - rob_pen, 0, B.MAX_FAITH)
                 result.faith_delta -= rob_pen
+
+            # 事件和结果是两件事，都要留在日志里。
+            # 早先只有一个 note，顺风一触发就把后面「超时失败」的原因盖掉了：
+            # 日志写着「顺风，快了一夜」，实际这封信没送到。
+            note = event_note
+            if outcome_note:
+                note = (event_note + " " + outcome_note).strip() if event_note else outcome_note
 
             trip = TripResult(
                 dispatch=d, rider_name=r.name, horse_name=h.name,
@@ -327,31 +389,56 @@ class GameState:
             if not delivered and not lost and self.rng.random() < 0.15:
                 r.state = "injured"
                 r.injured_nights = self.rng.randint(1, 2)
+                injured_tonight.add(r.id)
                 trip.note += " 骑手受了伤。"
 
-        # 休息
+        # 归零后没来得及出去的派单，补进拒收列表
+        if revoked_at is not None:
+            for d, _, _ in assignments[revoked_at + 1:]:
+                if d not in result.dropped:
+                    result.dropped.append(d)
+            self.note("信已见底，驿被撤了。剩下 %d 封信没能发出。"
+                      % (len(assignments) - revoked_at - 1), "end")
+
+        # 休息：自动推断，不靠调用方传参
         for r in self.riders:
-            if r.id in resting and r.state == "idle":
+            if r.state == "idle" and r.id not in used_r:
                 r.stamina = _clamp(r.stamina + B.REST_STAMINA_GAIN, 0, 100)
 
-        # 伤兵恢复
+        # 伤兵恢复。
+        #
+        # 关键：**本夜刚受伤的骑手不参与倒计时**。
+        # 早先这里是遍历所有 injured 骑手一律 -1，而受伤判定就在同一函数里、
+        # 就在上面——于是「抽到 1 夜的伤」当晚立刻被减到 0 直接痊愈。
+        # 实测 400 次强制失败：36 次保持受伤、20 次当场就好，
+        # 也就是说受伤机制有一半是失效的。
         for r in self.riders:
-            if r.state == "injured":
+            if r.state == "injured" and r.id not in injured_tonight:
                 r.injured_nights -= 1
                 if r.injured_nights <= 0:
                     r.state = "idle"
                     r.injured_nights = 0
                     self.note("%s 的伤好了。" % r.name)
 
-        # 马每夜自然恢复一点。
-        # 早先马不跑就永远不动，玩家会在第 6 夜左右突然发现「全员瘫痪」，
-        # 而且不知道是怎么走到那一步的。给一点自然恢复，让失误可挽回。
+        # 马每夜自然恢复一点——**只给今晚没出勤的马**。
+        # 早先这里是无条件遍历所有马，跑完任务的马当晚也会 +2，
+        # 于是实际净消耗变成「扣 15 再回 2」，和 README 写的
+        # 「不跑也会自己回一点」不符。
         for h in self.horses:
-            if h.condition < 100:
+            if h.id not in used_h and h.condition < 100:
                 h.condition = _clamp(h.condition + B.HORSE_NATURAL_RECOVERY, 0, 100)
 
         self.history.append(result)
         self.log_trips(result)
+
+        # 预报准不准，当场告诉玩家。
+        # 早先这个信息只在结算日志里有，游戏过程中完全没有反馈——
+        # 而「预报只有七成准」正是整个游戏的信息核心，
+        # 玩家却永远学不到它到底准到什么程度。
+        if not result.forecast_was_right:
+            self.note("昨夜预报 %s，实际 %s —— 没准。" % (
+                B.WEATHER[result.forecast]["name"],
+                B.WEATHER[result.weather]["name"]), "weather")
 
         # 结束判定
         if self.faith <= 0:
@@ -497,6 +584,7 @@ class GameState:
     # ────────────────────── 序列化（存档用） ──────────────────────
     def to_dict(self) -> dict:
         return {
+            "version": 2,
             "seed": self.seed,
             "night": self.night,
             "faith": self.faith,
@@ -514,4 +602,76 @@ class GameState:
             "log": self.log[-100:],
             "history": [nr.to_dict() for nr in self.history[-12:]],
             "rng_state": repr(self.rng.getstate()),
+            "used_names": sorted(self._used_names),
+            "used_horse_names": sorted(self._used_horse_names),
         }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "GameState":
+        """从存档恢复。
+
+        坑：`models._id_counter` 是模块级自增。如果直接构造对象，新 id 会从
+        当前计数器继续往上走——但读档时计数器可能比存档里的 id 小，
+        于是新雇的骑手会和存档里的骑手**撞号**。
+        所以恢复完立刻把计数器推到所有已有 id 之上。
+        """
+        from dataclasses import fields as _fields
+        from . import models as _m
+
+        # 绕开 __init__：它会把整局重开一遍
+        gs = cls.__new__(cls)
+
+        gs.seed = d.get("seed")
+        gs.rng = random.Random()
+        if d.get("rng_state"):
+            try:
+                gs.rng.setstate(ast.literal_eval(d["rng_state"]))
+            except (ValueError, SyntaxError):
+                # 随机状态坏了不至于让存档作废，只是这局不再可复现
+                gs.rng.seed(0 if gs.seed is None else gs.seed)
+
+        gs.night = int(d.get("night", 1))
+        gs.faith = int(d.get("faith", B.START_FAITH))
+        gs.gold = float(d.get("gold", B.START_GOLD))
+        gs.oil = float(d.get("oil", B.START_OIL))
+
+        gs.riders = [Rider.from_dict(x) for x in d.get("riders", [])]
+        gs.horses = [Horse.from_dict(x) for x in d.get("horses", [])]
+
+        gs.route_distance = dict(d.get("route_distance")
+                                 or {k: v["distance"] for k, v in B.ROUTES.items()})
+        gs.route_repaired = set(d.get("route_repaired") or [])
+
+        gs.weather = d.get("weather")
+        gs.forecast = d.get("forecast")
+        gs.dispatches = [Dispatch.from_dict(x) for x in d.get("dispatches", [])]
+
+        gs.over = bool(d.get("over", False))
+        gs.result = d.get("result")
+        gs.log = list(d.get("log") or [])
+        gs.history = []
+
+        # 名字池（供后续雇佣/买马取名）
+        gs._name_pool = [
+            "阿石", "老周", "七斤", "顺子", "哑叔", "小六", "阿桃",
+            "铁头", "麻子", "栓柱", "阿绣", "黑娃",
+        ]
+        gs._horse_pool = [
+            "踏雪", "赤云", "墨点", "黄骠", "白尾", "青鬃", "驮山", "小月",
+        ]
+        gs._used_names = set(d.get("used_names") or
+                             [r.name for r in gs.riders])
+        gs._used_horse_names = set(d.get("used_horse_names") or
+                                   [h.name for h in gs.horses])
+
+        # 把模块级 id 计数器推到所有已用 id 之上，避免撞号
+        max_id = 0
+        for obj in list(gs.riders) + list(gs.horses) + list(gs.dispatches):
+            try:
+                max_id = max(max_id, int(obj.id.lstrip("rhd")))
+            except (ValueError, AttributeError):
+                continue
+        if max_id > 0:
+            _m._id_counter = itertools.count(max_id + 1)
+
+        return gs

@@ -77,6 +77,13 @@ class App:
         self.fade.alpha = 0.0
 
     def start_new_game(self):
+        # 开新局前把上一局的自动存档清掉——否则标题页会挂着一个
+        # 属于另一局的「继续」，点进去是别人的进度。
+        try:
+            from ..core import save as SV
+            SV.delete("auto")
+        except Exception:
+            pass
         self.gs = GameState(seed=self.seed)
         self.scene = S.PlayScene(self, self.gs)
         self.fade.alpha = 0.0
@@ -149,9 +156,11 @@ class App:
 
             for ev in pygame.event.get():
                 if ev.type == pygame.QUIT:
+                    self._save_on_exit()
                     self.running = False
                 elif ev.type == pygame.KEYDOWN and ev.key == pygame.K_F4 and \
                         (ev.mod & pygame.KMOD_ALT):
+                    self._save_on_exit()
                     self.running = False
                 else:
                     if self.scene:
@@ -187,6 +196,16 @@ class App:
                 self.running = False
 
         pygame.quit()
+
+    def _save_on_exit(self):
+        """关窗口时存一次。一局 25 分钟，不能让人因为切窗口丢掉进度。"""
+        if not self.gs or self.gs.over:
+            return
+        try:
+            from ..core import save as SV
+            SV.save(self.gs, "auto")
+        except Exception:
+            pass
 
     def _draw(self):
         buf = pygame.Surface((T.WIDTH, T.HEIGHT))

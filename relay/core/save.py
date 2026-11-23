@@ -1,0 +1,123 @@
+# -*- coding: utf-8 -*-
+"""存档：读写磁盘。
+
+设计：
+  - 一个存档 = 一个 JSON 文件，放在 `logs/saves/` 旁边（exe 同目录）
+  - 三个手动槽 + 一个自动槽
+  - 带 version 字段，加载时做兼容
+  - 存档坏了不能崩游戏：读失败返回 None，并保留原文件
+
+存放位置和日志一致（`sys.executable` 所在目录），因为玩家要能找到。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+from .sim import GameState
+
+SAVE_VERSION = 2
+
+SLOTS = ("auto", "slot1", "slot2", "slot3")
+
+
+def saves_dir() -> Path:
+    """存档目录。打包后放在 exe 旁边，开发时放在项目根。"""
+    if getattr(sys, "frozen", False):
+        base = Path(sys.executable).resolve().parent
+    else:
+        base = Path(__file__).resolve().parent.parent.parent
+    d = base / "saves"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def slot_path(slot: str) -> Path:
+    return saves_dir() / ("%s.json" % slot)
+
+
+def save(gs: GameState, slot: str = "auto") -> Optional[Path]:
+    """存盘。成功返回路径，失败返回 None。
+
+    先写临时文件再替换，避免写到一半被打断留下半个存档。
+    """
+    try:
+        d = gs.to_dict()
+        d["version"] = SAVE_VERSION
+        d["saved_at"] = int(time.time())
+        p = slot_path(slot)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, p)
+        return p
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def load(slot: str = "auto") -> Optional[GameState]:
+    """读盘。不存在或坏掉返回 None——不能因为存档坏了就让游戏起不来。"""
+    p = slot_path(slot)
+    if not p.exists():
+        return None
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(d, dict):
+        return None
+    try:
+        gs = GameState.from_dict(d)
+    except (KeyError, TypeError, ValueError):
+        return None
+    return gs
+
+
+def exists(slot: str = "auto") -> bool:
+    return slot_path(slot).exists()
+
+
+def info(slot: str = "auto") -> Optional[dict]:
+    """不完整加载，只读元信息——给标题页显示「继续：第 7 夜，信 62」。"""
+    p = slot_path(slot)
+    if not p.exists():
+        return None
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(d, dict):
+        return None
+    return {
+        "slot": slot,
+        "night": d.get("night", 1),
+        "faith": d.get("faith", 0),
+        "gold": d.get("gold", 0),
+        "seed": d.get("seed"),
+        "saved_at": d.get("saved_at", 0),
+        "version": d.get("version", 1),
+    }
+
+
+def delete(slot: str = "auto") -> bool:
+    try:
+        p = slot_path(slot)
+        if p.exists():
+            p.unlink()
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def list_saves() -> list[dict]:
+    out = []
+    for s in SLOTS:
+        i = info(s)
+        if i:
+            out.append(i)
+    return out

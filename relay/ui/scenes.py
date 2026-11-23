@@ -95,6 +95,35 @@ class TitleScene:
         self.btn_back = W.Button((T.WIDTH // 2 - 60, T.HEIGHT - 90, 120, 38),
                                  "知道了", kind="normal", size=14)
 
+        # 存档
+        from ..core import save as SV
+        self.save_info = SV.info("auto")
+        self.btn_resume = None
+        if self.save_info:
+            # 有存档时把「入夜」上移，下面插一个「继续」
+            self.btn_start.rect.y = 420
+            self.btn_resume = W.Button((T.WIDTH // 2 - 90, 478, 180, 48),
+                                       "继续", kind="normal", size=16)
+            self.btn_help.rect.y = 536
+
+    def _resume(self):
+        from ..core import save as SV
+        gs = SV.load("auto")
+        if gs is None:
+            # 存档坏了：删掉它，别让玩家反复点进一个坏档
+            SV.delete("auto")
+            self.save_info = None
+            self.btn_resume = None
+            self.app.gs = None
+            self.app.scene = TitleScene(self.app)
+            return
+        self.app.gs = gs
+        if gs.over:
+            self.app.goto_result(gs)
+        else:
+            self.app.scene = PlayScene(self.app, gs)
+            self.app.fade.alpha = 0.0
+
     def handle(self, ev):
         if self.show_help:
             if self.btn_back.handle(ev):
@@ -104,6 +133,8 @@ class TitleScene:
             return
         if self.btn_start.handle(ev):
             self.app.start_new_game()
+        if self.btn_resume and self.btn_resume.handle(ev):
+            self._resume()
         if self.btn_help.handle(ev):
             self.show_help = True
 
@@ -130,10 +161,27 @@ class TitleScene:
 
         if not self.show_help:
             self.btn_start.draw(surf)
+            if self.btn_resume:
+                self.btn_resume.draw(surf)
             self.btn_help.draw(surf)
-            T.text(surf, "点「入夜」开始。十二个夜晚，把信送过山。",
-                   (T.WIDTH // 2, T.HEIGHT - 46), size=11, color=T.SNOW_FAINT,
-                   anchor="center")
+            if self.btn_resume and self.save_info:
+                si = self.save_info
+                box = pygame.Rect(0, 0, 360, 32)
+                box.center = (T.WIDTH // 2, 606)
+                # 底要够实：这块压在亮雪上，半透明会被吃掉
+                ov = pygame.Surface((box.width, box.height), pygame.SRCALPHA)
+                pygame.draw.rect(ov, (12, 18, 26, 235), ov.get_rect(), border_radius=8)
+                pygame.draw.rect(ov, T.NIGHT_3, ov.get_rect(), 1, border_radius=8)
+                surf.blit(ov, box.topleft)
+                label = "上一局  第 %d 夜" % si["night"]
+                T.text(surf, label, (box.centerx - 34, box.centery), size=12,
+                       color=T.SNOW_DIM, anchor="midright")
+                T.text(surf, "信 %d" % int(si["faith"]), (box.centerx - 22, box.centery),
+                       size=12, color=T.LAMP, anchor="midleft")
+            else:
+                T.text(surf, "点「入夜」开始。十二个夜晚，把信送过山。",
+                       (T.WIDTH // 2, T.HEIGHT - 46), size=11, color=T.SNOW_FAINT,
+                       anchor="center")
         else:
             self._draw_help(surf)
 
@@ -224,6 +272,22 @@ class PlayScene:
                 ("feed:" + h.id, W.Button((x, y + 170 + i * 40, 250, 32),
                                           "喂 %s" % h.name, size=12),
                  B.PRICES["feed"]))
+
+        # 修路按钮。
+        # 早先 repair_route() 只有实现、没有入口——是纯死代码：
+        # 玩家永远触发不到，整个功能等于不存在。修一次路短一截，每条路只能修一次。
+        for rk, rd in B.ROUTES.items():
+            if rk in gs.route_repaired:
+                continue
+            cur = gs.route_distance[rk]
+            if cur <= 1:
+                continue
+            self.shop_btns.append(
+                ("repair:" + rk,
+                 W.Button((x, y + 400, 250, 32),
+                          "修 %s（%d→%d 夜）" % (rd["name"], cur, cur - 1),
+                          size=12),
+                 rd["repair_cost"]))
 
     # ---- 事件 ----
     def handle(self, ev):
@@ -342,6 +406,12 @@ class PlayScene:
                 self.toast.show("喂过了。", "good")
             else:
                 self.toast.show("钱不够，或马不在了。", "bad")
+        elif key.startswith("repair:"):
+            rk = key.split(":", 1)[1]
+            if gs.repair_route(rk):
+                self.toast.show("修好了，路短了一截。", "good")
+            else:
+                self.toast.show("修不了——钱不够，或者已经修过了。", "bad")
         self._build_shop()
 
     def _send(self):
@@ -371,8 +441,21 @@ class PlayScene:
         self._build_shop()
 
         if gs.over:
+            # 结束了就把自动存档清掉，免得标题页一直挂着「继续」
+            try:
+                from ..core import save as SV
+                SV.delete("auto")
+            except Exception:
+                pass
             self.app.goto_result(gs)
             return
+
+        # 每夜自动存一次。玩家中途关窗口也不会丢进度。
+        try:
+            from ..core import save as SV
+            SV.save(gs, "auto")
+        except Exception:
+            pass
 
         if res.faith_delta < 0:
             A.play("fail")

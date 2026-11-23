@@ -305,5 +305,225 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(_clamp(99, 0, 10), 10)
 
 
+class TestRuleRegressions(unittest.TestCase):
+    """针对两份外部评审（哈基米 / 龙娘）指出的规则问题，各留一条回归测试。
+
+    这些规则以前没有测试覆盖——25 项全绿，但边界一条没测到。
+    """
+
+    # ── 派遣顺序不得影响结果 ──
+    def _snapshot(self, order, seed, oil):
+        gs = GameState(seed=seed)
+        gs.oil = oil
+        d0, d1 = gs.dispatches[0], gs.dispatches[1]
+        d0.route = d1.route = "mine"
+        d0.deadline = d1.deadline = 3
+        pairs = [(d0, gs.riders[0], gs.horses[0]),
+                 (d1, gs.riders[1], gs.horses[1])]
+        if order == "rev":
+            pairs = pairs[::-1]
+        gs.advance(pairs)
+        return sorted((t.rider_name, t.route, t.nights_taken, t.delivered, t.event)
+                      for t in gs.history[0].trips)
+
+    def test_assignment_order_does_not_matter(self):
+        """换点击顺序不能改变结果。
+
+        以前有两个独立的原因导致顺序有影响：
+          1. 灯系数每次现读 oil，而油在同一夜里边派边扣；
+          2. random 按派单顺序消耗，事件抽到什么都跟它是第几个结算有关。
+        现在灯系数夜初定死 + 按信 id 排序结算，两者都消掉了。
+        """
+        for seed in (42, 7, 101, 555):
+            for oil in (3, 5, 100):
+                self.assertEqual(self._snapshot("fwd", seed, oil),
+                                 self._snapshot("rev", seed, oil),
+                                 "种子 %d 油 %d 下顺序影响了结果" % (seed, oil))
+
+    # ── 信归零后不得继续结算 ──
+    def test_no_settlement_after_faith_zero(self):
+        gs = GameState(seed=1)
+        gs.faith = 3
+        for d in gs.dispatches[:2]:
+            d.deadline = 0
+            d.penalty = 5
+        gs.advance([(gs.dispatches[0], gs.riders[0], gs.horses[0]),
+                    (gs.dispatches[1], gs.riders[1], gs.horses[1])])
+        # 第一封就把信打到 0，第二封不该出去
+        self.assertEqual(len(gs.history[0].trips), 1)
+        self.assertTrue(gs.over)
+        # 第二匹马没被用过，状态不该动
+        self.assertEqual(gs.horses[1].condition, 100)
+
+    # ── 信必须是整数，且和日志差额完全对得上 ──
+    def test_faith_is_integer_and_deltas_add_up(self):
+        gs = GameState(seed=7)
+        start = gs.faith
+        total = 0
+        for _ in range(6):
+            if gs.over:
+                break
+            d = gs.dispatches[0]
+            d.kind = "urgent"
+            d.deadline = 99
+            gs.advance([(d, gs.riders[0], gs.horses[0])])
+            total += gs.history[-1].faith_delta
+        self.assertIsInstance(gs.faith, int)
+        self.assertEqual(gs.faith - start, total,
+                         "最终信和逐夜差额之和不等")
+
+    # ── 受伤当晚不得开始倒计时 ──
+    def test_new_injury_does_not_tick_same_night(self):
+        """本夜刚受伤的骑手，当夜不能被减成痊愈。
+
+        以前受伤判定和倒计时在同一函数里、倒计时在后面无条件遍历，
+        抽到「1 夜伤」的当晚就减到 0 直接好了——受伤机制一半失效。
+        """
+        healed_same_night = 0
+        injured_count = 0
+        for seed in range(200):
+            gs = GameState(seed=seed)
+            d = gs.dispatches[0]
+            d.deadline = 0
+            gs.advance([(d, gs.riders[0], gs.horses[0])])
+            if any("受了伤" in e["text"] for e in gs.log[-8:]):
+                injured_count += 1
+                if gs.riders[0].state != "injured":
+                    healed_same_night += 1
+        self.assertGreater(injured_count, 10, "样本里没抽到受伤，测不动")
+        self.assertEqual(healed_same_night, 0,
+                         "%d 次受伤里有 %d 次当晚就好了" % (injured_count, healed_same_night))
+
+    # ── 事件提示不得掩盖失败原因 ──
+    def test_event_note_does_not_mask_failure(self):
+        gs = GameState(seed=1)
+        d = gs.dispatches[0]
+        d.route = "mine"
+        d.deadline = 1
+        gs.travel_nights = lambda *a, **k: 3        # 强制 3 夜 > 期限 1
+        gs._roll_event = lambda *a, **k: "tailwind"
+        gs.advance([(d, gs.riders[0], gs.horses[0])])
+        t = gs.history[0].trips[0]
+        self.assertFalse(t.delivered)
+        self.assertIn("顺风", t.note)               # 事件要在
+        self.assertIn("晚", t.note)                 # 失败原因也要在
+
+    # ── 出勤的马不得吃自然恢复 ──
+    def test_working_horse_does_not_recover(self):
+        gs = GameState(seed=3)
+        gs.horses[0].condition = 60
+        gs.horses[1].condition = 60
+        gs.advance([(gs.dispatches[0], gs.riders[0], gs.horses[0])])
+        used = 60 - gs.horses[0].condition
+        idle = gs.horses[1].condition - 60
+        self.assertGreaterEqual(used, B.HORSE_COST_MIN)
+        self.assertLessEqual(used, B.HORSE_COST_MAX)
+        self.assertAlmostEqual(idle, B.HORSE_NATURAL_RECOVERY, places=5)
+
+    # ── 休息必须自动推断 ──
+    def test_resting_is_automatic(self):
+        gs = GameState(seed=5)
+        gs.riders[0].stamina = 40
+        gs.advance([])          # 不传 resting
+        self.assertAlmostEqual(gs.riders[0].stamina, 40 + B.REST_STAMINA_GAIN, places=5)
+
+        # 出勤的骑手不该额外回体力（他本来就扣了 Stamina）
+        gs2 = GameState(seed=5)
+        gs2.riders[0].stamina = 90
+        gs2.advance([(gs2.dispatches[0], gs2.riders[0], gs2.horses[0])])
+        self.assertLess(gs2.riders[0].stamina, 90)
+
+    # ── 预报错了要当场告诉玩家 ──
+    def test_forecast_miss_is_reported_in_game(self):
+        miss = 0
+        for seed in range(200):
+            gs = GameState(seed=seed)
+            gs.advance([])
+            if any("没准" in e["text"] for e in gs.log):
+                miss += 1
+        self.assertGreater(miss, 20, "预报错的反馈几乎没有")
+
+    # ── 天气档位选择：取最后一个 start <= night 的 ──
+    def test_weather_schedule_picks_latest_tier(self):
+        gs = GameState(seed=1)
+        self.assertEqual(gs._weather_weights(0),
+                         B.WEATHER_SCHEDULE[0][1])
+        self.assertEqual(gs._weather_weights(5),
+                         B.WEATHER_SCHEDULE[1][1])
+        self.assertEqual(gs._weather_weights(20),
+                         B.WEATHER_SCHEDULE[-1][1])
+
+
+class TestSaveLoad(unittest.TestCase):
+    """存档 / 读档。最容易出问题的是 id 计数器。"""
+
+    def _played(self, nights=5):
+        gs = GameState(seed=17)
+        gs.gold = 500
+        for _ in range(nights):
+            if gs.over:
+                break
+            riders = [r for r in gs.riders if r.state == "idle"]
+            if riders and gs.horses and gs.dispatches:
+                gs.advance([(gs.dispatches[0], riders[0], gs.horses[0])])
+            else:
+                gs.advance([])
+        return gs
+
+    def test_roundtrip_preserves_state(self):
+        import json
+        gs = self._played()
+        back = GameState.from_dict(json.loads(json.dumps(gs.to_dict(), ensure_ascii=False)))
+        self.assertEqual(back.night, gs.night)
+        self.assertEqual(back.faith, gs.faith)
+        self.assertAlmostEqual(back.gold, gs.gold)
+        self.assertAlmostEqual(back.oil, gs.oil)
+        self.assertEqual(back.weather, gs.weather)
+        self.assertEqual(back.forecast, gs.forecast)
+        self.assertEqual(back.route_distance, gs.route_distance)
+        self.assertEqual([r.id for r in back.riders], [r.id for r in gs.riders])
+        self.assertEqual([h.id for h in back.horses], [h.id for h in gs.horses])
+        self.assertEqual([d.id for d in back.dispatches], [d.id for d in gs.dispatches])
+
+    def test_id_counter_does_not_collide_after_load(self):
+        """读档后新建的对象不能和存档里的撞号。
+
+        models._id_counter 是模块级自增。如果读档时不把它推到已有 id 之上，
+        新雇的骑手会拿到和存档里某个骑手相同的 id——然后派单、存档、查表全乱。
+        """
+        import json
+        gs = self._played(6)
+        back = GameState.from_dict(json.loads(json.dumps(gs.to_dict(), ensure_ascii=False)))
+        used = {o.id for o in list(back.riders) + list(back.horses) + list(back.dispatches)}
+        back.gold = 10000
+        r = back.hire_rider()
+        h = back.buy_horse()
+        self.assertIsNotNone(r)
+        self.assertIsNotNone(h)
+        self.assertNotIn(r.id, used, "新骑手 id 撞了")
+        self.assertNotIn(h.id, used, "新马 id 撞了")
+
+    def test_can_continue_after_load(self):
+        import json
+        gs = self._played(4)
+        back = GameState.from_dict(json.loads(json.dumps(gs.to_dict(), ensure_ascii=False)))
+        night_before = back.night
+        back.advance([])
+        self.assertTrue(back.night > night_before or back.over, "读档后推进不动")
+
+    def test_broken_save_does_not_raise(self):
+        """坏档必须返回 None，不能把游戏带崩。"""
+        from relay.core import save as SV
+        import time
+        slot = "slot3"
+        p = SV.slot_path(slot)
+        p.write_text("{ 这不是 json", encoding="utf-8")
+        try:
+            self.assertIsNone(SV.load(slot))
+            self.assertIsNone(SV.info(slot))
+        finally:
+            SV.delete(slot)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
