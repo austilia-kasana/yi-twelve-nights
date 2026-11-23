@@ -337,18 +337,21 @@ class GameState:
                 if delivered:
                     self.gold += d.reward
                     # 信按整数累加。
-                    # 早先这里用浮点累加、日志里却用 int(round(...)) 记差量，
-                    # 两边会越走越远：实测 6 次送达就差了 2.4 点，
-                    # 复盘时「每一笔都对，加起来不等于总数」。
+                    # 差额必须记「实际变化」，不是「打算加多少」——
+                    # 撞到 0 或 100 的边界时两者不同：信 99 时送达八百里（+7），
+                    # 实际只加到 100（+1），但早先记录的是 +7，
+                    # 结算页的「本夜信 +7」就和真实状态对不上。
+                    old = self.faith
                     gain = int(round(B.FAITH_PER_DELIVER
                                      * B.FAITH_DELIVER_MULT[d.kind]))
-                    self.faith = _clamp(self.faith + gain, 0, B.MAX_FAITH)
+                    self.faith = _clamp(old + gain, 0, B.MAX_FAITH)
                     result.gold_delta += d.reward
-                    result.faith_delta += gain
+                    result.faith_delta += self.faith - old
                     outcome_note = "送到了。"
                 else:
-                    self.faith = _clamp(self.faith - d.penalty, 0, B.MAX_FAITH)
-                    result.faith_delta -= d.penalty
+                    old = self.faith
+                    self.faith = _clamp(old - d.penalty, 0, B.MAX_FAITH)
+                    result.faith_delta += self.faith - old
                     if nights >= 99:
                         outcome_note = "没能送出去。"
                     else:
@@ -358,9 +361,10 @@ class GameState:
                 # 早先这里是全额罚——八百里一次 -20 信，相当于总信量的 1/4，
                 # 而触发概率只有 5%。打满一局才发现：一次骰子就能抹掉四夜的进度，
                 # 那不是难度，是方差。现在保留痛感（-7~10），但不再致命。
+                old = self.faith
                 rob_pen = max(1, d.penalty // 2)
-                self.faith = _clamp(self.faith - rob_pen, 0, B.MAX_FAITH)
-                result.faith_delta -= rob_pen
+                self.faith = _clamp(old - rob_pen, 0, B.MAX_FAITH)
+                result.faith_delta += self.faith - old
 
             # 事件和结果是两件事，都要留在日志里。
             # 早先只有一个 note，顺风一触发就把后面「超时失败」的原因盖掉了：
@@ -392,13 +396,17 @@ class GameState:
                 injured_tonight.add(r.id)
                 trip.note += " 骑手受了伤。"
 
-        # 归零后没来得及出去的派单，补进拒收列表
+        # 归零后没来得及出去的派单，补进拒收列表。
+        #
+        # 索引从 revoked_at（不是 revoked_at + 1）开始：
+        # revoked_at 是「发现已经归零、因此 break 掉」的那一封，它自己也没出去。
+        # 早先从 +1 开始，那一封就凭空消失了——拒收少算一封、日志也少一条。
         if revoked_at is not None:
-            for d, _, _ in assignments[revoked_at + 1:]:
+            for d, _, _ in assignments[revoked_at:]:
                 if d not in result.dropped:
                     result.dropped.append(d)
-            self.note("信已见底，驿被撤了。剩下 %d 封信没能发出。"
-                      % (len(assignments) - revoked_at - 1), "end")
+            remaining = len(assignments) - revoked_at
+            self.note("信已见底，驿被撤了。剩下 %d 封信没能发出。" % remaining, "end")
 
         # 休息：自动推断，不靠调用方传参
         for r in self.riders:
@@ -649,7 +657,14 @@ class GameState:
         gs.over = bool(d.get("over", False))
         gs.result = d.get("result")
         gs.log = list(d.get("log") or [])
-        gs.history = []
+
+        # 历史必须一起恢复。
+        # 早先这里写的是 gs.history = []，而 to_dict() 明明存了 —— 于是：
+        #   1. 读档后累计送达率只统计读档之后的部分，终局显示的数字是错的；
+        #   2. 更糟：如果读档后一封信都没派，_finish() 会看到 total==0，
+        #      判成「十二夜过去了，你一封也没派出去」直接失败。
+        #      玩家存了档反而更容易输。
+        gs.history = [NightResult.from_dict(x) for x in d.get("history", [])]
 
         # 名字池（供后续雇佣/买马取名）
         gs._name_pool = [

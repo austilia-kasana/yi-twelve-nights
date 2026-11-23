@@ -147,6 +147,20 @@ class TripResult:
             "event": self.event, "note": self.note,
         }
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "TripResult":
+        return cls(
+            dispatch=Dispatch.from_dict(d["dispatch"]),
+            rider_name=d.get("rider_name", ""),
+            horse_name=d.get("horse_name", ""),
+            route=d.get("route", "north"),
+            nights_taken=int(d.get("nights_taken", 0)),
+            delivered=bool(d.get("delivered", False)),
+            lost=bool(d.get("lost", False)),
+            event=d.get("event", "calm"),
+            note=d.get("note", ""),
+        )
+
 
 # ────────────────────────── 一夜的结算 ──────────────────────────
 @dataclass
@@ -169,3 +183,16 @@ class NightResult:
             "gold_delta": self.gold_delta, "faith_delta": self.faith_delta,
             "dropped": [d.to_dict() for d in self.dropped],
         }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "NightResult":
+        return cls(
+            night=int(d.get("night", 1)),
+            weather=d.get("weather", "clear"),
+            forecast=d.get("forecast", "clear"),
+            forecast_was_right=bool(d.get("forecast_was_right", False)),
+            trips=[TripResult.from_dict(x) for x in d.get("trips", [])],
+            gold_delta=int(d.get("gold_delta", 0)),
+            faith_delta=int(d.get("faith_delta", 0)),
+            dropped=[Dispatch.from_dict(x) for x in d.get("dropped", [])],
+        )

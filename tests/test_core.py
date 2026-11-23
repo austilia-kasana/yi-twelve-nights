@@ -525,5 +525,132 @@ class TestSaveLoad(unittest.TestCase):
             SV.delete(slot)
 
 
+class TestV03Regressions(unittest.TestCase):
+    """v0.3.0 里新引入的三个 bug（龙娘在评审中抓到的）。
+
+    共同点：都是「修一个 bug 的时候带出来的新 bug」。
+    """
+
+    def _played(self, nights=6):
+        gs = GameState(seed=17)
+        for _ in range(nights):
+            if gs.over:
+                break
+            riders = [r for r in gs.riders if r.state == "idle"]
+            if riders and gs.horses and gs.dispatches:
+                gs.advance([(gs.dispatches[0], riders[0], gs.horses[0])])
+            else:
+                gs.advance([])
+        return gs
+
+    # ── ① 读档必须恢复 history ──
+    def test_load_restores_history(self):
+        import json
+        gs = self._played()
+        back = GameState.from_dict(json.loads(json.dumps(gs.to_dict(), ensure_ascii=False)))
+        self.assertEqual(len(back.history), len(gs.history),
+                         "history 没恢复，结算的送达率会只算读档之后")
+        for a, b in zip(gs.history, back.history):
+            self.assertEqual(
+                (a.night, a.weather, a.forecast, a.gold_delta, a.faith_delta),
+                (b.night, b.weather, b.forecast, b.gold_delta, b.faith_delta))
+            self.assertEqual(len(a.trips), len(b.trips))
+
+    def test_load_then_idle_is_not_judged_as_idle_fail(self):
+        """读档后一封信都不派，不能因为 history 空了就被判「一封也没派出去」。
+
+        这是 history 丢失最严重的连带后果：玩家存了档反而更容易输。
+        """
+        import json
+        gs = self._played()
+        self.assertGreater(sum(len(nr.trips) for nr in gs.history), 0)
+        back = GameState.from_dict(json.loads(json.dumps(gs.to_dict(), ensure_ascii=False)))
+        while not back.over:
+            back.advance([])
+        self.assertTrue((back.result or {}).get("survived"),
+                        "读档后全程不派被判失败——history 没恢复")
+
+    # ── ② 信值差额要记实际变化 ──
+    def test_faith_delta_respects_clamp(self):
+        # 上界：99 送达八百里（+7）实际只到 100
+        gs = GameState(seed=1)
+        gs.faith = 99
+        d = gs.dispatches[0]
+        d.kind = "express"
+        d.deadline = 99
+        gs.advance([(d, gs.riders[0], gs.horses[0])])
+        self.assertEqual(gs.faith - 99, gs.history[-1].faith_delta,
+                         "撞到 100 上限时差额记错了")
+
+        # 下界：3 被罚 8，实际只掉到 0
+        gs = GameState(seed=1)
+        gs.faith = 3
+        d = gs.dispatches[0]
+        d.deadline = 0
+        d.penalty = 8
+        gs.advance([(d, gs.riders[0], gs.horses[0])])
+        self.assertEqual(gs.faith - 3, gs.history[-1].faith_delta,
+                         "撞到 0 下限时差额记错了")
+
+    # ── ③ 归零后拒收索引 ──
+    def test_revoked_includes_the_blocking_dispatch(self):
+        """归零 break 掉的那一封自己也没出去，必须计入拒收。"""
+        gs = GameState(seed=1)
+        gs.gold = 10000
+        while len(gs.riders) < 3:
+            gs.hire_rider()
+        while len(gs.horses) < 3:
+            gs.buy_horse()
+        gs.faith = 3
+        ds = gs.dispatches[:3]
+        for x in ds:
+            x.deadline = 0
+            x.penalty = 5
+        gs.advance([(ds[0], gs.riders[0], gs.horses[0]),
+                    (ds[1], gs.riders[1], gs.horses[1]),
+                    (ds[2], gs.riders[2], gs.horses[2])])
+        nr = gs.history[0]
+        self.assertEqual(len(nr.trips), 1)
+        self.assertEqual(len(nr.dropped), 2,
+                         "少算了一封：索引应该从 revoked_at 而不是 revoked_at+1 开始")
+
+
+class TestSaveVersioning(unittest.TestCase):
+    """存档版本检查与迁移。"""
+
+    def test_unknown_future_version_returns_none(self):
+        import json
+        from relay.core import save as SV
+        gs = GameState(seed=5)
+        gs.advance([])
+        SV.save(gs, "slot2")
+        try:
+            p = SV.slot_path("slot2")
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            raw["version"] = 99
+            p.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+            self.assertIsNone(SV.load("slot2"), "比本程序新的存档应该拒绝加载")
+        finally:
+            SV.delete("slot2")
+
+    def test_v1_save_can_be_migrated(self):
+        import json
+        from relay.core import save as SV
+        gs = GameState(seed=5)
+        gs.advance([])
+        SV.save(gs, "slot2")
+        try:
+            p = SV.slot_path("slot2")
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            raw["version"] = 1
+            raw["faith"] = 61.7          # v1 里 faith 可能是浮点
+            p.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+            back = SV.load("slot2")
+            self.assertIsNotNone(back, "v1 存档应该能迁移加载")
+            self.assertIsInstance(back.faith, int, "迁移后 faith 应该是整数")
+        finally:
+            SV.delete("slot2")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

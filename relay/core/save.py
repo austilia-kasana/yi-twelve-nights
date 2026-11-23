@@ -60,7 +60,10 @@ def save(gs: GameState, slot: str = "auto") -> Optional[Path]:
 
 
 def load(slot: str = "auto") -> Optional[GameState]:
-    """读盘。不存在或坏掉返回 None——不能因为存档坏了就让游戏起不来。"""
+    """读盘。不存在、版本不认识、或坏掉都返回 None。
+
+    不能因为存档坏了就让游戏起不来——宁可丢掉存档，也不能崩。
+    """
     p = slot_path(slot)
     if not p.exists():
         return None
@@ -70,11 +73,47 @@ def load(slot: str = "auto") -> Optional[GameState]:
         return None
     if not isinstance(d, dict):
         return None
+
+    ver = d.get("version", 1)
+    if ver > SAVE_VERSION:
+        # 比本程序新的存档，别猜怎么读
+        return None
+    if ver < SAVE_VERSION:
+        d = _migrate(d, ver)
+        if d is None:
+            return None
+
     try:
         gs = GameState.from_dict(d)
     except (KeyError, TypeError, ValueError):
         return None
     return gs
+
+
+def _migrate(d: dict, from_ver: int) -> Optional[dict]:
+    """把旧版存档升到当前版本。识别不了的版本返回 None。
+
+    v1（0.2.0）：没有 history 的 from_dict 支持、faith 可能是浮点、
+                 没有 used_names。能读，但历史会是空的。
+    v2（0.3.0）：history 存了但读的时候没恢复（那个 bug 已修）。
+                 结构上已经是当前格式，直接放行。
+    """
+    if from_ver == 2:
+        d["version"] = SAVE_VERSION
+        return d
+    if from_ver == 1:
+        # 最老的一版：faith 可能是浮点，history 结构没有 from_dict
+        d["version"] = SAVE_VERSION
+        d.setdefault("faith", 50)
+        try:
+            d["faith"] = int(round(float(d["faith"])))
+        except (TypeError, ValueError):
+            d["faith"] = 50
+        d.setdefault("history", [])
+        d.setdefault("used_names", [])
+        d.setdefault("used_horse_names", [])
+        return d
+    return None
 
 
 def exists(slot: str = "auto") -> bool:
