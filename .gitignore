@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# 运行时产物
+logs/
+seed.txt
+
+# 工具临时产物
+tools/_test/
+tools/_gen.log
+tools/_s_seeds.json
+tools/_shot*.png
+tools/_smoke*.png
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
