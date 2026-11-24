@@ -24,7 +24,7 @@ from typing import Iterable, Optional
 
 from . import balance as B
 from .models import (ActiveTrip, Dispatch, Horse, NightResult, Rider,
-                     TripResult)
+                     TripResult, id_key)
 
 
 # ────────────────────────── 工具 ──────────────────────────
@@ -236,6 +236,57 @@ class GameState:
         return (rider.effective_speed() * horse.effective_speed()
                 * wf * light * B.BASE_TRAVEL)
 
+    def _roll_trip_event(self, trip: ActiveTrip, weather: str) -> str:
+        """一夜一个在途事件。
+
+        权重表是按「每趟一次」标定的，这里换算成「每夜」：
+
+            p_night = 1 - (1 - p_trip) ** (1 / planned_nights)
+
+        不能直接用 p_trip / N —— 那只是小概率下的近似，
+        长途会系统性偏低，短途会偏高。
+        """
+        raw = {k: v["weight"] for k, v in B.EVENTS.items()}
+        total = sum(raw.values())
+        if total <= 0:
+            return "calm"
+
+        # 天气/路线修正
+        rc = B.ROCKFALL_CONDITION
+        if trip.route == rc["route"] and weather == rc["weather"]:
+            raw["rockfall"] *= rc["mult"]
+        rb = B.ROBBERY_CONDITION
+        if weather == rb["weather"]:
+            raw["robbery"] *= rb["mult"]
+        risk = B.WEATHER[weather]["risk"]
+        raw["calm"] = max(20.0, raw["calm"] * (1.0 - risk))
+
+        total = sum(raw.values())
+        n = max(B.EVENT_NIGHTS_MIN, float(trip.planned_nights))
+
+        # 逐项换算成每夜概率
+        probs = {}
+        for k, w in raw.items():
+            if k == "calm":
+                continue
+            p_trip = w / total
+            probs[k] = 1.0 - (1.0 - p_trip) ** (1.0 / n)
+
+        p_any = sum(probs.values())
+        if p_any <= 0:
+            return "calm"
+        if self.rng.random() >= p_any:
+            return "calm"
+
+        # 在「发生事件」的前提下按相对概率挑一个
+        r = self.rng.random() * p_any
+        acc = 0.0
+        for k, p in probs.items():
+            acc += p
+            if r <= acc:
+                return k
+        return list(probs)[-1]
+
     # ────────────────────── 在途查询 ──────────────────────
     def is_busy(self, rider_id: Optional[str] = None,
                 horse_id: Optional[str] = None) -> bool:
@@ -311,7 +362,7 @@ class GameState:
 
         # 按信 id 排序后再登记。
         # random 是按顺序消耗的，排序保证「谁先抽到什么」和 UI 点击顺序无关。
-        assignments.sort(key=lambda a: a[0].id)
+        assignments.sort(key=lambda a: id_key(a[0]))
 
         weather = self.weather or "clear"
         result = NightResult(
@@ -349,29 +400,71 @@ class GameState:
                 elapsed_nights=0,
                 due_night=self.night + d.deadline - 1,
                 light_factor=light,
+                # 出发时的行程估计，给事件概率换算用
+                planned_nights=self.travel_nights(d, r, h, weather, light),
             ))
 
         # 拒收的信（本夜清单里没被派出去的那些）
         result.dropped = [d for d in self.dispatches if d.id not in taken_ids]
 
         # ── ② 推进所有在途（含刚出发的）──
-        # 按任务 id 排序推进：多个任务同夜推进时，谁先抽到事件不能由
-        # 列表插入顺序决定。
+        # 按任务 id 的**数值**排序推进：多个任务同夜推进时，
+        # 谁先抽到事件不能由列表插入顺序或 id 的字符串形态决定。
         injured_tonight: set[str] = set()
-        for trip in sorted(self.trips, key=lambda t: t.id):
+        robbed: list[ActiveTrip] = []
+        for trip in sorted(self.trips, key=id_key):
             rider = self.rider_by_id(trip.rider_id)
             horse = self.horse_by_id(trip.horse_id)
             if rider is None or horse is None:
                 continue
+
             # 天气每夜重算，灯火用出发时锁定的快照
             per = self.night_progress(trip.route, rider, horse,
                                       weather, trip.light_factor)
+
+            # 每夜一个事件
+            event = self._roll_trip_event(trip, weather)
+            if event != "calm":
+                eff = B.EVENT_EFFECTS.get(event, {})
+                per *= eff.get("progress_mult", 1.0)
+                trip.distance += eff.get("distance_add", 0.0)
+                trip.events.append({"night": self.night, "event": event})
+                if event == "robbery":
+                    robbed.append(trip)
+
             trip.progress += per
             trip.elapsed_nights += 1
 
+        # 遇劫：任务立即终止，人马下一夜归队（信丢了）
+        for trip in robbed:
+            if trip in self.trips:
+                self.trips.remove(trip)
+            rider = self.rider_by_id(trip.rider_id)
+            horse = self.horse_by_id(trip.horse_id)
+            old = self.faith
+            rob_pen = max(1, trip.dispatch.penalty // 2)
+            self.faith = _clamp(old - rob_pen, 0, B.MAX_FAITH)
+            result.faith_delta += self.faith - old
+            result.trips.append(TripResult(
+                dispatch=trip.dispatch,
+                rider_name=rider.name if rider else "?",
+                horse_name=horse.name if horse else "?",
+                route=trip.route,
+                nights_taken=trip.elapsed_nights,
+                delivered=False, lost=True, event="robbery",
+                note="遇劫，信没了。",
+            ))
+            # 遇劫的人更容易受伤
+            if rider is not None and rider.state == "idle":
+                if self.rng.random() < B.ROBBERY_INJURY_CHANCE:
+                    rider.state = "injured"
+                    rider.injured_nights = self.rng.randint(1, 3)
+                    injured_tonight.add(rider.id)
+                    result.trips[-1].note += " 骑手受了伤。"
+
         # ── ③ 统一结算抵达 ──
         arrived = [t for t in self.trips if t.arrived()]
-        arrived.sort(key=lambda t: t.id)
+        arrived.sort(key=id_key)
 
         revoked = False
         for trip in arrived:
@@ -394,7 +487,7 @@ class GameState:
         if self.faith <= 0:
             left = list(self.trips)
             self.trips.clear()
-            for trip in sorted(left, key=lambda t: t.id):
+            for trip in sorted(left, key=id_key):
                 rider = self.rider_by_id(trip.rider_id)
                 horse = self.horse_by_id(trip.horse_id)
                 result.trips.append(TripResult(
@@ -470,7 +563,7 @@ class GameState:
             return
         left = list(self.trips)
         self.trips.clear()
-        for trip in sorted(left, key=lambda t: t.id):
+        for trip in sorted(left, key=id_key):
             d = trip.dispatch
             rider = self.rider_by_id(trip.rider_id)
             horse = self.horse_by_id(trip.horse_id)

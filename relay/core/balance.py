@@ -132,17 +132,52 @@ FEED_CONDITION_GAIN = 40.0
 HORSE_NATURAL_RECOVERY = 2.0
 
 # ────────────────────────── 事件 ──────────────────────────
-# 每趟出行按天气 risk 掷一次；数值是相对权重
+# 权重表原本是按「**每趟**掷一次」标定的（v0.3.x 的老模型）。
+#
+# 在途模型下改成「**每夜**掷一次」，直接套用会让长途的事故率爆炸：
+# 一趟 3 夜的行程，累计事故概率会变成 1-(1-p)³。
+#
+# 换算方式（龙娘指出不能用 p/N 直接除）：
+#
+#     p_night = 1 - (1 - p_trip) ** (1 / N)
+#
+# 这样 N 夜累计起来仍然约等于原来的 p_trip。见 sim._roll_trip_event()。
 EVENTS = {
     "tailwind": {"name": "顺风", "weight": 8,  "desc": "风在背后推着走"},
     "lost":     {"name": "迷路", "weight": 10, "desc": "雾里绕了半宿"},
-    "rockfall": {"name": "落石", "weight": 6,  "desc": "路塌了，只能回头"},
+    "rockfall": {"name": "落石", "weight": 6,  "desc": "路塌了，只能绕"},
     "robbery":  {"name": "遇劫", "weight": 5,  "desc": "信没了"},
     "calm":     {"name": "无事", "weight": 71, "desc": ""},
 }
+
+# 每夜事件的效果。
+#
+# **设计原则**（不是为了凑胜率调的数字）：
+#   顺风 ×2.0 —— 「一夜赶出两夜的路」。必须能给到 2.0，否则在整数夜边界上
+#                 根本省不下一夜（实测 ×1.5 时顺风救不了任何一趟）。
+#   迷路 ×0.5 —— 「雾里绕了半宿」，本夜只走一半。
+#   落石 ×0.0 + 距离 +1 —— 「路塌了，只能绕」。这一夜白走，而且路变长了。
+#   遇劫     —— 信丢，任务立即终止。
+#
+# 对照：旧模型（每趟一次）里顺风是「总行程 -1 夜」，换算成新模型就该是
+# 本夜进度翻倍——因为一夜翻倍 = 这一夜走了两夜的路。
+EVENT_EFFECTS = {
+    "tailwind": {"progress_mult": 2.0,  "distance_add": 0.0, "abort": False},
+    "lost":     {"progress_mult": 0.5,  "distance_add": 0.0, "abort": False},
+    "rockfall": {"progress_mult": 0.0,  "distance_add": 1.0, "abort": False},
+    "robbery":  {"progress_mult": 0.0,  "distance_add": 0.0, "abort": True},
+}
+
 # 雪天北口落石翻倍；暴雪遇劫翻倍
 ROCKFALL_CONDITION = {"route": "north", "weather": "snow", "mult": 2.0}
 ROBBERY_CONDITION = {"weather": "storm", "mult": 2.0}
+
+# 换算时用的行程夜数下限。就算是「一夜任务」也要按一夜算，
+# 否则 1/N 会除出大于 1 的指数。
+EVENT_NIGHTS_MIN = 1.0
+
+# 遇劫后骑手受伤的概率（比正常抵达失败更高——是被打的）
+ROBBERY_INJURY_CHANCE = 0.40
 
 # ────────────────────────── 信件 ──────────────────────────
 DISPATCH_KINDS = {

@@ -19,6 +19,20 @@ def _next_id(prefix: str) -> str:
     return "%s%d" % (prefix, next(_id_counter))
 
 
+def id_key(obj_or_id) -> int:
+    """按 id 排序用的数值键。
+
+    **不能用字符串排序。** id 是 `d5 d6 ... d9 d10 ... d65` 这种，
+    字符串排序会把 "d10" 排在 "d9" 前面——一个 GameState 里 id 跨过
+    位数边界时，结算顺序就悄悄变了，而结算顺序决定随机数消耗顺序。
+
+    后果：同种子跑两次可能得出不同结果，读档续跑也会和一口气跑完分叉。
+    """
+    s = obj_or_id.id if hasattr(obj_or_id, "id") else str(obj_or_id)
+    digits = "".join(ch for ch in s if ch.isdigit())
+    return int(digits) if digits else 0
+
+
 # ────────────────────────── 骑手 ──────────────────────────
 @dataclass
 class Rider:
@@ -150,6 +164,7 @@ class ActiveTrip:
     elapsed_nights: int = 0
     due_night: int = 1         # 绝对夜数 = depart_night + deadline - 1
     light_factor: float = 1.0  # 出发时锁定，整趟不变
+    planned_nights: int = 1    # 出发时的行程估计，用于事件概率换算
     events: list = field(default_factory=list)
     id: str = field(default_factory=lambda: _next_id("t"))
 
@@ -180,6 +195,7 @@ class ActiveTrip:
             "elapsed_nights": self.elapsed_nights,
             "due_night": self.due_night,
             "light_factor": self.light_factor,
+            "planned_nights": self.planned_nights,
             "events": list(self.events),
         }
 
@@ -196,6 +212,7 @@ class ActiveTrip:
             elapsed_nights=int(d.get("elapsed_nights", 0)),
             due_night=int(d.get("due_night", 1)),
             light_factor=float(d.get("light_factor", 1.0)),
+            planned_nights=int(d.get("planned_nights", 1)),
             events=list(d.get("events") or []),
             id=d.get("id", _next_id("t")),
         )
