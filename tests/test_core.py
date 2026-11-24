@@ -345,8 +345,12 @@ class TestRuleRegressions(unittest.TestCase):
     # ── 信归零后不得继续结算 ──
     def test_no_settlement_after_faith_zero(self):
         gs = GameState(seed=1)
+        # 显式裁到 2 封，避免实测信件数变化让断言漂移
+        gs.dispatches = gs.dispatches[:2]
+        gs.night_progress = lambda *a, **k: 99.0  # 当夜必抵达
+        gs._roll_trip_event = lambda *a, **k: "calm"
         gs.faith = 3
-        for d in gs.dispatches[:2]:
+        for d in gs.dispatches:
             d.deadline = 0
             d.penalty = 5
         gs.advance([(gs.dispatches[0], gs.riders[0], gs.horses[0]),
@@ -625,8 +629,13 @@ class TestV03Regressions(unittest.TestCase):
             gs.hire_rider()
         while len(gs.horses) < 3:
             gs.buy_horse()
+        # 显式裁到 3 封：实测信件数会随随机流变化，
+        # 不裁的话 dropped 会把多出来的那封算进去。
+        gs.dispatches = gs.dispatches[:3]
+        gs.night_progress = lambda *a, **k: 99.0  # 当夜必抵达
+        gs._roll_trip_event = lambda *a, **k: "calm"
         gs.faith = 3
-        ds = gs.dispatches[:3]
+        ds = gs.dispatches
         for x in ds:
             x.deadline = 0
             x.penalty = 5
@@ -1319,6 +1328,166 @@ class TestEventSampling(unittest.TestCase):
         # 主随机流不该受影响
         for _ in range(10):
             self.assertAlmostEqual(a.rng.random(), b.rng.random(), places=12)
+
+
+class TestRound05(unittest.TestCase):
+    """Round 0.5：结算闭环补强（GPT/Gemini 裁决要求）。"""
+
+    # ── ④ 混合结算必须检查**实际信值**，不只是记录顺序 ──
+    def _mixed(self, robbery_is_higher, faith_start=40, penalty=50):
+        """构造同夜「一笔抵达 + 一笔遇劫」，返回 (gs, nr, lo, hi)。"""
+        from relay.core.models import id_key
+        gs = GameState(seed=8)
+        gs.weather = "clear"
+        gs.forecast = "clear"
+        gs.night_progress = lambda *a, **k: 99.0     # 当夜必抵达
+        gs.gold = 10000
+        while len(gs.riders) < 2:
+            gs.hire_rider()
+        while len(gs.horses) < 2:
+            gs.buy_horse()
+        gs.dispatches = gs.dispatches[:2]
+        ds = gs.dispatches
+        for d in ds:
+            d.route = "north"
+            d.deadline = 1
+            d.penalty = penalty
+        lo, hi = sorted(ds, key=id_key)
+        victim = hi if robbery_is_higher else lo
+        gs._roll_trip_event = lambda trip, w: (
+            "robbery" if trip.dispatch.id == victim.id else "calm")
+        gs.faith = faith_start
+        gs.advance([(ds[0], gs.riders[0], gs.horses[0]),
+                    (ds[1], gs.riders[1], gs.horses[1])])
+        return gs, gs.history[0], lo, hi
+
+    def test_mixed_settlement_faith_value(self):
+        """同夜「抵达 + 遇劫」的实际信值必须等于按 ID 顺序手算的结果。
+
+        只断言记录顺序是不够的——副作用（加信/扣信）也必须按同一个顺序落账，
+        否则会出现「记录说送到了，但信其实没加上」。
+        """
+        from relay.core import balance as B
+
+        # 场景 A：id 小的抵达（先进账），id 大的遇劫（后扣账）
+        gs_a, nr_a, lo_a, hi_a = self._mixed(robbery_is_higher=True,
+                                             faith_start=40, penalty=20)
+        # 信件种类不一定是「寻常」，要按实际那封算
+        arriving = next(t for t in nr_a.trips if t.delivered)
+        gain = int(round(B.FAITH_PER_DELIVER
+                         * B.FAITH_DELIVER_MULT[arriving.dispatch.kind]))
+        rob = max(1, 20 // 2)
+        expect_a = min(B.MAX_FAITH, 40 + gain) - rob
+        self.assertEqual(gs_a.faith, expect_a,
+                         "场景A：按 ID 顺序应为 40+%d-%d=%d" % (gain, rob, expect_a))
+        self.assertEqual(nr_a.faith_delta, gs_a.faith - 40,
+                         "faith_delta 必须等于实际变化")
+
+        # 场景 B：id 小的遇劫（先扣账），id 大的抵达（后进账）
+        gs_b, nr_b, lo_b, hi_b = self._mixed(robbery_is_higher=False,
+                                             faith_start=40, penalty=20)
+        arriving_b = next(t for t in nr_b.trips if t.delivered)
+        gain_b = int(round(B.FAITH_PER_DELIVER
+                           * B.FAITH_DELIVER_MULT[arriving_b.dispatch.kind]))
+        expect_b = min(B.MAX_FAITH, max(0, 40 - rob) + gain_b)
+        self.assertEqual(gs_b.faith, expect_b,
+                         "场景B：按 ID 顺序应为 40-%d+%d=%d" % (rob, gain_b, expect_b))
+        self.assertEqual(nr_b.faith_delta, gs_b.faith - 40)
+
+    def test_mixed_settlement_order_changes_outcome(self):
+        """两种顺序**必须**给出不同的信值，否则说明顺序没真正生效。
+
+        用 **100 上限夹断**构造差异（不能用 0 下限：信归零后剩余结算会被
+        中止，两种顺序都会停在 0，分不出来）：
+
+            起点 98，罚款 50 → rob=25
+            A（小 id 抵达先进账）：98 + gain → 夹到 100，再 -25 → 75
+            B（小 id 遇劫先扣账）：98 - 25 = 73，再 + gain → 77
+        """
+        gs_a, nr_a, _, _ = self._mixed(robbery_is_higher=True, faith_start=98,
+                                       penalty=50)
+        gs_b, nr_b, _, _ = self._mixed(robbery_is_higher=False, faith_start=98,
+                                       penalty=50)
+        self.assertNotEqual(gs_a.faith, gs_b.faith,
+                            "两种顺序结果相同，说明副作用顺序没真正按 id 生效")
+
+        # 手算两边的期望值。注意 A 的进账会撞 100 上限而被夹断，
+        # 所以 A 反而比 B 低 —— 这正是「顺序真的生效了」的证据。
+        from relay.core import balance as B
+        gain_a = int(round(B.FAITH_PER_DELIVER * B.FAITH_DELIVER_MULT[
+            next(t for t in nr_a.trips if t.delivered).dispatch.kind]))
+        gain_b = int(round(B.FAITH_PER_DELIVER * B.FAITH_DELIVER_MULT[
+            next(t for t in nr_b.trips if t.delivered).dispatch.kind]))
+        rob = max(1, 50 // 2)
+        expect_a = min(B.MAX_FAITH, 98 + gain_a) - rob
+        expect_b = min(B.MAX_FAITH, max(0, 98 - rob) + gain_b)
+        self.assertEqual(gs_a.faith, expect_a,
+                         "A（小 id 先抵达）：98+%d 夹断到 100，再 -%d" % (gain_a, rob))
+        self.assertEqual(gs_b.faith, expect_b,
+                         "B（小 id 先遇劫）：98-%d 再 +%d" % (rob, gain_b))
+        # A 因为撞上限少拿了，所以严格小于 B
+        self.assertLess(gs_a.faith, gs_b.faith,
+                        "A 撞 100 上限被夹断，应低于 B")
+
+    # ── ⑤ 同一封信不能派两次 ──
+    def test_duplicate_dispatch_rejected(self):
+        gs = GameState(seed=1)
+        while len(gs.riders) < 2:
+            gs.hire_rider()
+        while len(gs.horses) < 2:
+            gs.buy_horse()
+        d = gs.dispatches[0]
+        with self.assertRaises(ValueError) as ctx:
+            gs.advance([(d, gs.riders[0], gs.horses[0]),
+                        (d, gs.riders[1], gs.horses[1])])
+        self.assertIn("同一封信", str(ctx.exception))
+
+    # ── world_rng 必须独立 ──
+    def test_world_rng_is_separate(self):
+        """消耗 world_rng 不能影响 self.rng，反之亦然。
+
+        不拆开的话「同 seed 不同策略」不是配对实验——
+        策略改变派单数会改变消耗抽签次数，天气也跟着变。
+        """
+        a = GameState(seed=7)
+        b = GameState(seed=7)
+        # 在 a 上狂抽世界流（模拟不同策略产生的不同信件数）
+        for _ in range(200):
+            a.world_rng.random()
+        # 主随机流不该受影响
+        for _ in range(10):
+            self.assertAlmostEqual(a.rng.random(), b.rng.random(), places=12)
+
+        c = GameState(seed=7)
+        d = GameState(seed=7)
+        for _ in range(200):
+            c.rng.random()
+        for _ in range(10):
+            self.assertAlmostEqual(c.world_rng.random(), d.world_rng.random(),
+                                   places=12)
+
+    def test_same_seed_same_world_regardless_of_play(self):
+        """两个同 seed 的局，前 N 夜的世界（天气+信件）必须完全一致，
+        即使一局在狂派单、另一局躺平。"""
+        a = GameState(seed=11)
+        b = GameState(seed=11)
+
+        def snapshot(gs):
+            return (gs.night, gs.weather, gs.forecast,
+                    [(d.route, d.kind, d.deadline, d.reward, d.penalty)
+                     for d in gs.dispatches])
+
+        for _ in range(5):
+            # a 派单，b 躺平
+            riders = a.available_riders()
+            horses = a.available_horses()
+            if riders and horses and a.dispatches:
+                a.advance([(a.dispatches[0], riders[0], horses[0])])
+            else:
+                a.advance([])
+            b.advance([])
+            self.assertEqual(snapshot(a), snapshot(b),
+                             "派单与否改变了世界生成（天气/信件），配对实验不成立")
 
 
 if __name__ == "__main__":

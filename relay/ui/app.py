@@ -108,8 +108,10 @@ class App:
                and guard < 40):
             guard += 1
             gs = self.gs
-            riders = [r for r in gs.riders if r.state == "idle"]
-            horses = list(gs.horses)
+            # 一律走可用性 API：在途的人马不能派，否则 advance() 会抛
+            # ValueError("还在路上")，被下面的 except 吞掉，autoplay 会静默停住。
+            riders = gs.available_riders()
+            horses = gs.available_horses()
             plan = []
             used_r, used_h = set(), set()
             # 贪心：给每封信挑最快的可用组合
@@ -137,7 +139,9 @@ class App:
                 used_h.add(h.id)
                 plan.append((d, r, h))
             resting = {r.id for r in gs.riders
-                       if r.state == "idle" and r.id not in used_r}
+                       if r.state == "idle"
+                       and not gs.is_busy(rider_id=r.id)
+                       and r.id not in used_r}
             try:
                 gs.advance(plan, resting)
             except Exception:

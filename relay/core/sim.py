@@ -50,7 +50,13 @@ class GameState:
     # ────────────────────── 构造 ──────────────────────
     def __init__(self, seed: Optional[int] = None):
         self.seed = seed
-        # 主随机流：信件生成、天气、受伤、采购
+        # 世界随机流：天气、预报、信件生成、取名。
+        # 独立出来的原因：策略改变派单数会改变消耗抽签次数，
+        # 如果和世界生成共用一条流，天气也会跟着变——
+        # 「同 seed 不同策略」就不是配对实验了。
+        self.world_rng = random.Random(
+            None if seed is None else seed ^ 0x7A11D5EED)
+        # 主随机流：体力/马/油消耗、抵达受伤、雇人买马速度
         self.rng = random.Random(seed)
         # 独立的事件流。
         #
@@ -122,7 +128,7 @@ class GameState:
         return table
 
     def roll_weather(self, night: int) -> str:
-        return _weighted_choice(self.rng, self._weather_weights(night))
+        return _weighted_choice(self.world_rng, self._weather_weights(night))
 
     def roll_forecast(self, actual: str) -> str:
         """预报有 FORECAST_ACCURACY 的概率说对。
@@ -130,7 +136,7 @@ class GameState:
         说错时不会离得太离谱：只跳到相邻的天气档
         （晴↔阴↔雨↔雪↔暴雪），避免「预报晴、实际暴雪」这种致命欺骗。
         """
-        if self.rng.random() < B.FORECAST_ACCURACY:
+        if self.world_rng.random() < B.FORECAST_ACCURACY:
             return actual
         order = ["clear", "cloud", "rain", "snow", "storm"]
         i = order.index(actual)
@@ -139,7 +145,7 @@ class GameState:
             return order[1]
         if i == len(order) - 1:
             return order[-2]
-        return order[i + self.rng.choice([-1, 1])]
+        return order[i + self.world_rng.choice([-1, 1])]
 
     # ────────────────────── 信件生成 ──────────────────────
     def _pick_kind(self, night: int) -> str:
@@ -148,31 +154,31 @@ class GameState:
             if k == "express" and night < B.EXPRESS_STARTS_NIGHT:
                 continue
             kinds[k] = d["weight"]
-        return _weighted_choice(self.rng, kinds)
+        return _weighted_choice(self.world_rng, kinds)
 
     def _pick_name(self, pool: list, used: set) -> str:
         free = [n for n in pool if n not in used]
         if not free:
             return "无名"
-        n = self.rng.choice(free)
+        n = self.world_rng.choice(free)
         used.add(n)
         return n
 
     def _make_dispatch(self, night: int) -> Dispatch:
         kind = self._pick_kind(night)
         kd = B.DISPATCH_KINDS[kind]
-        route = self.rng.choice(list(B.ROUTES))
+        route = self.world_rng.choice(list(B.ROUTES))
 
         # 期限 = 该路线的基准夜数 + 该种类的余量
         slack = kd["slack"]
         if "slack_mix" in kd:
-            slack = self.rng.choice(kd["slack_mix"])
+            slack = self.world_rng.choice(kd["slack_mix"])
         deadline = B.ROUTE_BASE_NIGHTS[route] + slack
 
         r_lo, r_hi = kd["reward"]
         p_lo, p_hi = kd["penalty"]
-        reward = self.rng.randint(r_lo, r_hi)
-        penalty = self.rng.randint(p_lo, p_hi)
+        reward = self.world_rng.randint(r_lo, r_hi)
+        penalty = self.world_rng.randint(p_lo, p_hi)
 
         return Dispatch(
             route=route, kind=kind, deadline=deadline,
@@ -201,13 +207,13 @@ class GameState:
                 "粮尽。此信若到，请勿再发援。",
             ],
         }
-        return self.rng.choice(lines.get(kind, ["—"]))
+        return self.world_rng.choice(lines.get(kind, ["—"]))
 
     def begin_night(self):
         """进入黄昏：定天气、出预报、收信。"""
         self.weather = self.roll_weather(self.night)
         self.forecast = self.roll_forecast(self.weather)
-        n = self.rng.randint(*B.DISPATCHES_PER_NIGHT)
+        n = self.world_rng.randint(*B.DISPATCHES_PER_NIGHT)
         self.dispatches = [self._make_dispatch(self.night) for _ in range(n)]
         self.note("第 %d 夜。%s" % (self.night, B.WEATHER[self.forecast]["desc"]))
 
@@ -370,13 +376,16 @@ class GameState:
 
         assignments = list(assignments)
 
-        # 用到的骑手/马不能重复
-        seen_r, seen_h = set(), set()
+        # 用到的骑手/马/信都不能重复
+        seen_d, seen_r, seen_h = set(), set(), set()
         for d, r, h in assignments:
+            if d.id in seen_d:
+                raise ValueError("同一封信被派了两次：%s" % d.id)
             if r.id in seen_r:
                 raise ValueError("同一个骑手被派了两次：%s" % r.name)
             if h.id in seen_h:
                 raise ValueError("同一匹马被用了两次：%s" % h.name)
+            seen_d.add(d.id)
             if self.is_busy(rider_id=r.id):
                 raise ValueError("%s 还在路上" % r.name)
             if self.is_busy(horse_id=h.id):
@@ -881,6 +890,7 @@ class GameState:
             "log": self.log[-100:],
             "history": [nr.to_dict() for nr in self.history[-12:]],
             "rng_state": repr(self.rng.getstate()),
+            "world_rng_state": repr(self.world_rng.getstate()),
             "event_rng_state": repr(self.event_rng.getstate()),
             "used_names": sorted(self._used_names),
             "used_horse_names": sorted(self._used_horse_names),
@@ -909,6 +919,16 @@ class GameState:
             except (ValueError, SyntaxError):
                 # 随机状态坏了不至于让存档作废，只是这局不再可复现
                 gs.rng.seed(0 if gs.seed is None else gs.seed)
+
+        # 世界随机流独立，单独恢复。
+        gs.world_rng = random.Random()
+        _s = gs.seed
+        gs.world_rng.seed(None if _s is None else _s ^ 0x7A11D5EED)
+        if d.get("world_rng_state"):
+            try:
+                gs.world_rng.setstate(ast.literal_eval(d["world_rng_state"]))
+            except (ValueError, SyntaxError):
+                pass
 
         # 事件随机流独立，单独恢复。
         # 旧存档（v3 之前）没有这个字段：用同样的派生规则重建，
