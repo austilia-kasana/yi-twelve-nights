@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from relay.core import balance as B            # noqa: E402
 from relay.core.sim import GameState           # noqa: E402
-from ai import Strategy, play                  # noqa: E402
+from ai import Strategy, SmartStrategy, SmartAltStrategy, play  # noqa: E402
 
 
 # ── 策略变体 ──
@@ -55,6 +55,10 @@ STRATEGIES = {
     "wide": Strategy(hire_below=5, horse_cap=5),
     # 只追信：不管金
     "faith": Strategy(prefer_faith=True, min_margin=0, rest_at=40),
+    # 会算账：编制目标用总数，先保马再雇人（Round 1 新增）
+    "smart": SmartStrategy(min_margin=1),
+    # 对照：编制目标用 min(骑手数, 马数) 的另一种公式
+    "smart_alt": SmartAltStrategy(min_margin=1),
 }
 
 

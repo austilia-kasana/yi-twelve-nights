@@ -139,6 +139,114 @@ class Strategy:
         return done
 
 
+@dataclass
+class SmartStrategy(Strategy):
+    """更会玩的玩家：先算「同时能跑几趟」，再决定买什么。
+
+    ## 为什么需要它
+
+    Round 0 指标显示 base 策略会雇到 4 个骑手，却只买 2 匹马：
+    买马要求 255 金（155 + 100 余量），雇人只要 130，所以钱都花在人上了。
+    结果「人一堆，马两匹」，最多同时跑 2 趟，派遣利用率只有 35.7%。
+
+    **但这不能直接证明「数值有问题」** —— 也可能只是这个 AI 不会算账。
+    所以先做一个会算账的 AI，再看基准数据。
+
+    ## 三条设计（按 GPT/Gemini 裁决）
+
+    1. **编制目标用总数**：`target = min(len(gs.riders), horse_cap)`。
+       用**总骑手数**，不用 `available_riders()`——在途的人也是编制的一部分，
+       用可用数会让目标随当天在途人数缩水，永远追不上。
+
+    2. **买马保护添油预算**：买之前先扣掉两夜的油钱，
+       否则会出现「马买了、油没了、全队减速 35%」的净亏。
+
+    3. **余量筛选**：`min_margin=1`。Round 0 数据显示零余量派单是亏损的。
+    """
+
+    # 编制目标上限（只用于这个策略的买马判断）
+    team_cap: int = 4
+    # 买马前要留几夜的油钱
+    oil_reserve_nights: int = 2
+
+    def shop(self, gs: GameState, used_r: set) -> list[str]:
+        done = []
+
+        # ① 油是刚需：没灯全队减速 35%
+        if gs.oil < self.oil_at and gs.gold >= B.PRICES["oil"]:
+            if gs.buy_oil():
+                done.append("添油")
+
+        # ② 喂最瘦的马
+        if gs.gold >= B.PRICES["feed"] + 60:
+            worst = min(gs.horses, key=lambda x: x.condition, default=None)
+            if worst and worst.condition < self.feed_at:
+                if gs.feed(worst.id):
+                    done.append("喂" + worst.name)
+
+        # ③ 算「同时能跑几趟」= min(骑手总数, 马总数)
+        #    这才是吞吐天花板，不是可用人数。
+        target_horses = min(len(gs.riders), self.team_cap)
+        oil_floor = B.PRICES["oil"] * self.oil_reserve_nights
+
+        # ④ 马不够就先补马（人比马便宜，先雇人就永远缺马）
+        if len(gs.horses) < target_horses:
+            if gs.gold - B.PRICES["buy_horse"] >= oil_floor:
+                h = gs.buy_horse()
+                if h:
+                    done.append("买" + h.name)
+                    return done
+
+        # ⑤ 人不够再雇
+        if len(gs.riders) < self.hire_below:
+            if gs.gold - B.PRICES["hire_rider"] >= oil_floor:
+                r = gs.hire_rider()
+                if r:
+                    done.append("雇" + r.name)
+
+        return done
+
+
+@dataclass
+class SmartAltStrategy(SmartStrategy):
+    """`smart` 的对照变体：编制目标按 Q1 的另一种公式算。
+
+    `target = min(骑手总数, 马总数)` —— 「马够配人就行」。
+    用来回答 RELAY_Q1 的 Q1：两种公式哪个更能打通吞吐。
+    """
+
+    def shop(self, gs: GameState, used_r: set) -> list[str]:
+        # 只在买马判断上不同，其他照抄父类
+        done = []
+        if gs.oil < self.oil_at and gs.gold >= B.PRICES["oil"]:
+            if gs.buy_oil():
+                done.append("添油")
+        if gs.gold >= B.PRICES["feed"] + 60:
+            worst = min(gs.horses, key=lambda x: x.condition, default=None)
+            if worst and worst.condition < self.feed_at:
+                if gs.feed(worst.id):
+                    done.append("喂" + worst.name)
+
+        target = min(len(gs.riders), len(gs.horses))
+        oil_floor = B.PRICES["oil"] * self.oil_reserve_nights
+
+        # 这个公式在「人 4 马 2」时 target=2，马数已等于目标 → 不会买马。
+        # 保留它是为了用数据证明这个公式不行。
+        if len(gs.horses) < min(target, self.team_cap):
+            if gs.gold - B.PRICES["buy_horse"] >= oil_floor:
+                h = gs.buy_horse()
+                if h:
+                    done.append("买" + h.name)
+                    return done
+
+        if len(gs.riders) < self.hire_below:
+            if gs.gold - B.PRICES["hire_rider"] >= oil_floor:
+                r = gs.hire_rider()
+                if r:
+                    done.append("雇" + r.name)
+        return done
+
+
 def play(gs: GameState, strat: Optional[Strategy] = None,
          max_turns: int = 40) -> GameState:
     """用一套策略把一局打完。"""
