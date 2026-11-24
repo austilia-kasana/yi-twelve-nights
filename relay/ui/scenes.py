@@ -186,35 +186,62 @@ class TitleScene:
             self._draw_help(surf)
 
     def _draw_help(self, surf):
-        panel = pygame.Rect(0, 0, 780, 460)
+        # 发布验收要求（GPT/Gemini 裁决）：
+        #   玩家必须能从这里看懂 ①在途占用 ②抵达夜不可派遣
+        #   ③每夜天气重算 ④事件效果
+        # 所以面板做高一点，分成四小节。
+        panel = pygame.Rect(0, 0, 820, 620)
         panel.center = (T.WIDTH // 2, T.HEIGHT // 2)
         ov = pygame.Surface((T.WIDTH, T.HEIGHT), pygame.SRCALPHA)
         ov.fill((0, 0, 0, 170))
         surf.blit(ov, (0, 0))
         T.panel(surf, panel, T.NIGHT_2, T.NIGHT_3, radius=14)
 
-        x = panel.left + 36
-        y = panel.top + 28
-        T.text(surf, "怎么玩", (x, y), size=20, color=T.LAMP)
-        y += 40
-        lines = [
-            ("每夜黄昏会收到三到五封信。", T.SNOW),
-            ("每封信有目的地、期限、赏钱、罚信。你只能派人去送，或者拒收。", T.SNOW_DIM),
-            ("", T.DIM),
-            ("操作：点一封信选中它，再点一个骑手派给他，再点一匹马换马。", T.SNOW),
-            ("同一个骑手、同一匹马，一夜只能用一次。", T.SNOW_DIM),
-            ("", T.DIM),
-            ("送达 → 得金、加信。延误或丢失 → 扣信。信归零，驿就被撤了。", T.SNOW),
-            ("十二夜之后，信到 60 以上，才算守住。", T.SNOW_DIM),
-            ("", T.DIM),
-            ("关键：天气预报只有七成准。", T.WARN),
-            ("预报说晴，也许下雪。要不要押，是你的事。", T.SNOW_DIM),
-        ]
-        for s, c in lines:
+        x = panel.left + 34
+        y = panel.top + 24
+
+        def head(s):
+            nonlocal y
+            T.text(surf, s, (x, y), size=17, color=T.LAMP)
+            y += 28
+
+        def line(s, c=T.SNOW, indent=0):
+            nonlocal y
             if s:
-                T.text(surf, s, (x, y), size=14, color=c)
-            y += 24
-        self.btn_back.rect.center = (panel.centerx, panel.bottom - 40)
+                T.text(surf, s, (x + indent, y), size=13, color=c)
+            y += 21
+
+        head("怎么玩")
+        line("每夜黄昏会收到三到五封信。每封有目的地、期限、赏钱、罚信。", T.SNOW)
+        line("点一封信选中它，再点骑手派给他，再点一匹马换马。", T.SNOW, 12)
+        line("十二夜后信到 60 以上才算守住；信归零，驿就被撤了。", T.SNOW_DIM, 12)
+        y += 6
+
+        head("① 在途占用")
+        line("派出的人和马不是当夜就回来。路程几夜，他们就占用几夜。", T.SNOW)
+        line("占用期间他们不在左边列表里，也不能派去别的信。", T.SNOW_DIM, 12)
+        line("每张信上标着「在途 N%」，N 到 100% 就是到了。", T.SNOW_DIM, 12)
+        y += 6
+
+        head("② 抵达当夜不能再用")
+        line("人马抵达的那一夜仍然算占用，要等到下一夜才能再派。", T.SNOW)
+        line("所以算排班时要多留一夜——这也是为什么「余量」很重要。", T.SNOW_DIM, 12)
+        y += 6
+
+        head("③ 天气每夜重算")
+        line("天气不是出发时锁死的，每一夜都会重新变。", T.SNOW)
+        line("出发时晴天，不代表路上一直晴。预报只有七成准。", T.SNOW_DIM, 12)
+        line("你的「预计 N 夜」是按预报算的，变天就会更久。", T.SNOW_DIM, 12)
+        y += 6
+
+        head("④ 路上会发生事")
+        line("每在途一夜，都有一点点概率碰到事。碰到的事会写在日志里。", T.SNOW)
+        line("顺风 → 这一夜走得更快；迷路 → 只走一半。", T.SNOW_DIM, 12)
+        line("落石 → 这一夜原地不动（和迷路不同，是完全不前进）。", T.SNOW_DIM, 12)
+        line("遇劫 → 这封信直接丢了，还要扣罚信。骑手可能受伤。", T.WARN, 12)
+        line("事件概率是固定的，不是随机惩罚——你能靠余量对冲。", T.SNOW_DIM, 12)
+
+        self.btn_back.rect.center = (panel.centerx, panel.bottom - 36)
         self.btn_back.draw(surf)
 
 

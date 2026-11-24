@@ -60,6 +60,11 @@ class App:
         elif shot_scene == "result":
             self.start_new_game()
             self._autoplay(self.autoplay or 12)
+        elif shot_scene == "help":
+            # 自测用：直接打开标题界面并展开帮助面板，方便截图核查
+            self.goto_title()
+            if hasattr(self.scene, "show_help"):
+                self.scene.show_help = True
         else:
             self.goto_title()
 
@@ -232,7 +237,7 @@ def main(argv=None):
     ap.add_argument("--shot", default=None, help="在第 --shot-at 帧保存截图到此路径")
     ap.add_argument("--shot-at", type=int, default=40)
     ap.add_argument("--shot-scene", default="title",
-                    choices=["title", "play", "result"])
+                    choices=["title", "play", "result", "help"])
     ap.add_argument("--autoplay", type=int, default=0,
                     help="无头自动玩 N 夜（配合 --shot-scene play）")
     args = ap.parse_args(argv)
