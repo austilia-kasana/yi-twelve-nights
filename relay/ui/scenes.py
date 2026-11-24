@@ -190,7 +190,7 @@ class TitleScene:
         #   玩家必须能从这里看懂 ①在途占用 ②抵达夜不可派遣
         #   ③每夜天气重算 ④事件效果
         # 所以面板做高一点，分成四小节。
-        panel = pygame.Rect(0, 0, 820, 620)
+        panel = pygame.Rect(0, 0, 840, 692)
         panel.center = (T.WIDTH // 2, T.HEIGHT // 2)
         ov = pygame.Surface((T.WIDTH, T.HEIGHT), pygame.SRCALPHA)
         ov.fill((0, 0, 0, 170))
@@ -198,18 +198,18 @@ class TitleScene:
         T.panel(surf, panel, T.NIGHT_2, T.NIGHT_3, radius=14)
 
         x = panel.left + 34
-        y = panel.top + 24
+        y = panel.top + 18
 
         def head(s):
             nonlocal y
             T.text(surf, s, (x, y), size=17, color=T.LAMP)
-            y += 28
+            y += 24
 
         def line(s, c=T.SNOW, indent=0):
             nonlocal y
             if s:
                 T.text(surf, s, (x + indent, y), size=13, color=c)
-            y += 21
+            y += 18
 
         head("怎么玩")
         line("每夜黄昏会收到三到五封信。每封有目的地、期限、赏钱、罚信。", T.SNOW)
@@ -237,11 +237,22 @@ class TitleScene:
         head("④ 路上会发生事")
         line("每在途一夜，都有一点点概率碰到事。碰到的事会写在日志里。", T.SNOW)
         line("顺风 → 这一夜走得更快；迷路 → 只走一半。", T.SNOW_DIM, 12)
-        line("落石 → 这一夜原地不动（和迷路不同，是完全不前进）。", T.SNOW_DIM, 12)
+        line("落石 → 这一夜原地不动（和迷路不同，是完全不前进）。", T.WARN, 12)
         line("遇劫 → 这封信直接丢了，还要扣罚信。骑手可能受伤。", T.WARN, 12)
         line("事件概率是固定的，不是随机惩罚——你能靠余量对冲。", T.SNOW_DIM, 12)
+        y += 6
 
-        self.btn_back.rect.center = (panel.centerx, panel.bottom - 36)
+        # 外部评估指出：只讲机制、不讲「怎么想」，新手懂了机制也不会做决策。
+        # 这一节补的是判断方法，不是规则。
+        head("⑤ 那到底该怎么想")
+        line("看「期限 - 预计夜数」这个差，就是你的余量。", T.LAMP)
+        line("余量 2 以上：基本稳，可以放心接。", T.SNOW_DIM, 12)
+        line("余量 1：要赌一次变天。大多数时候划算。", T.SNOW_DIM, 12)
+        line("余量 0：这趟只有「一路顺风」才成。输了要赔罚信。", T.WARN, 12)
+        line("真正的决策是「这一夜把人马用在哪封信上」——用一次少一次。", T.SNOW)
+        line("前期不缺信时稳着来；后期信吃紧时，才值得赌。", T.SNOW_DIM)
+
+        self.btn_back.rect.center = (panel.centerx, panel.bottom - 30)
         self.btn_back.draw(surf)
 
 
