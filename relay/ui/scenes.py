@@ -853,8 +853,11 @@ class ResultScene:
         for i, (k, v) in enumerate(items):
             col = i % 4
             cx = box.left + 70 + col * 140
-            T.text(surf, k, (cx, box.top + 34), size=12, color=T.DIM, anchor="center")
-            T.text(surf, v, (cx, box.top + 66), size=22,
+            # 标签用 SNOW_DIM 而不是 DIM：DIM 在深色面板上几乎看不见，
+            # 玩家只能看到数值、不知道数值是什么意思。
+            T.text(surf, k, (cx, box.top + 34), size=13, color=T.SNOW_DIM,
+                   anchor="center")
+            T.text(surf, v, (cx, box.top + 68), size=22,
                    color=T.LAMP if i == 3 else T.SNOW, anchor="center", bold=True)
 
         self.btn_again.draw(surf, 0.016)
