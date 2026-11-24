@@ -1,3 +1,3 @@
 # -*- coding: utf-8 -*-
-VERSION = "0.1.0"
-CODENAME = "初夜"
+VERSION = "0.5.0"
+CODENAME = "断崖"
