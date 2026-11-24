@@ -435,6 +435,9 @@ class GameState:
         # 拒收的信（本夜清单里没被派出去的那些）
         result.dropped = [d for d in self.dispatches if d.id not in taken_ids]
 
+        # 本夜归队的人马集合（抵达 + 遇劫）。他们当夜不恢复。
+        returned_tonight: set = set()
+
         # ── ② 推进所有在途（含刚出发的）──
         # 按任务 id 的**数值**排序推进：多个任务同夜推进时，
         # 谁先抽到事件不能由列表插入顺序或 id 的字符串形态决定。
@@ -463,63 +466,52 @@ class GameState:
             trip.progress += per
             trip.elapsed_nights += 1
 
-        # 遇劫：任务立即终止，人马下一夜归队（信丢了）
-        robbery_results = []
+        # 遇劫：先把任务从在途列表摘下、**把人马记进「本夜归队」**，
+        # 但效果（扣信、受伤）延后到阶段③统一按 id 生效。
+        robbery_trips = []
         for trip in robbed:
             if trip in self.trips:
                 self.trips.remove(trip)
-            rider = self.rider_by_id(trip.rider_id)
-            horse = self.horse_by_id(trip.horse_id)
-            old = self.faith
-            rob_pen = max(1, trip.dispatch.penalty // 2)
-            self.faith = _clamp(old - rob_pen, 0, B.MAX_FAITH)
-            result.faith_delta += self.faith - old
-            tr = TripResult(
-                dispatch=trip.dispatch,
-                rider_name=rider.name if rider else "?",
-                horse_name=horse.name if horse else "?",
-                route=trip.route,
-                nights_taken=trip.elapsed_nights,
-                delivered=False, lost=True, event="robbery",
-                note="遇劫，信没了。",
-                events=list(trip.events),
-            )
-            # 遇劫的人更容易受伤
-            if rider is not None and rider.state == "idle":
-                if self.rng.random() < B.ROBBERY_INJURY_CHANCE:
-                    rider.state = "injured"
-                    rider.injured_nights = self.rng.randint(1, 3)
-                    injured_tonight.add(rider.id)
-                    tr.note += " 骑手受了伤。"
-            robbery_results.append(tr)
+            returned_tonight.add(trip.rider_id)
+            returned_tonight.add(trip.horse_id)
+            robbery_trips.append(trip)
 
         # ── ③ 统一结算抵达 ──
         #
         # 遇劫的结果在阶段②就已经产生了，抵达的结果在这里产生。
         # 如果先后 append，同一夜的结果顺序就取决于「哪个阶段先跑」，
         # 而不是 id。所以这里把三类结果**先收集、再按 id 排序、最后统一写入**。
-        pending = list(robbery_results)
-
         arrived = [t for t in self.trips if t.arrived()]
-        arrived.sort(key=id_key)
 
-        # 本夜归队的人马——他们**当夜不恢复**，下一夜才开始恢复和重新派遣
-        returned_tonight: set = set()
-
+        # 本夜归队的人马——他们**当夜不恢复**，下一夜才开始恢复和重新派遣。
+        # 遇劫的在上面已经加进来了。
         for trip in arrived:
             returned_tonight.add(trip.rider_id)
             returned_tonight.add(trip.horse_id)
+
+        # 把「遇劫」和「抵达」放进同一个列表，**按 id 排序后依次生效**。
+        #
+        # 早先是「阶段②遇劫立刻扣信 → 阶段③抵达再加信」，
+        # 于是同一夜里遇劫永远先于抵达生效，不管 id 谁小。
+        # 后果：id 小的那封本该先送达，却因为 id 大的先遇劫把信扣光，
+        # 被记成 aborted ——记录和效果双双失真。
+        settlements = [("robbery", t) for t in robbery_trips]
+        settlements += [("arrival", t) for t in arrived]
+        settlements.sort(key=lambda x: id_key(x[1].dispatch))
+
+        for kind, trip in settlements:
             if self.faith <= 0:
                 # 已经判定失败：这趟不能再结算，但**必须留下记录**，
                 # 否则它会从 history 里凭空消失、送达率分母也少算。
-                pending.append(self._aborted_result(
+                result.trips.append(self._aborted_result(
                     trip, "驿被撤了，这封信没能送到。"))
                 continue
-            pending.append(self._resolve_arrival(trip, result, injured_tonight))
-
-        # 统一按 id 排序后写入。三类结果（遇劫 / 抵达 / 终止）不再分先后。
-        pending.sort(key=lambda t: id_key(t.dispatch))
-        result.trips.extend(pending)
+            if kind == "robbery":
+                result.trips.append(
+                    self._resolve_robbery(trip, result, injured_tonight))
+            else:
+                result.trips.append(
+                    self._resolve_arrival(trip, result, injured_tonight))
 
         # 已抵达的都从在途列表移除
         arrived_ids = {t.id for t in arrived}
@@ -600,6 +592,38 @@ class GameState:
             self.begin_night()
 
         return result
+
+    def _resolve_robbery(self, trip: ActiveTrip, result: NightResult,
+                         injured_tonight: set) -> TripResult:
+        """遇劫结算：扣一半罚款，概率受伤。"""
+        rider = self.rider_by_id(trip.rider_id)
+        horse = self.horse_by_id(trip.horse_id)
+
+        old = self.faith
+        rob_pen = max(1, trip.dispatch.penalty // 2)
+        self.faith = _clamp(old - rob_pen, 0, B.MAX_FAITH)
+        result.faith_delta += self.faith - old
+
+        tr = TripResult(
+            dispatch=trip.dispatch,
+            rider_name=rider.name if rider else "?",
+            horse_name=horse.name if horse else "?",
+            route=trip.route,
+            nights_taken=trip.elapsed_nights,
+            delivered=False, lost=True, event="robbery",
+            note="遇劫，信没了。",
+            events=list(trip.events),
+        )
+        # 遇劫的人更容易受伤。
+        # 用 event_rng，不用主随机流——否则只要局内发生遇劫，
+        # 开/关事件做 A/B 时后续天气流就会分歧。
+        if rider is not None and rider.state == "idle":
+            if self.event_rng.random() < B.ROBBERY_INJURY_CHANCE:
+                rider.state = "injured"
+                rider.injured_nights = self.event_rng.randint(1, 3)
+                injured_tonight.add(rider.id)
+                tr.note += " 骑手受了伤。"
+        return tr
 
     def _aborted_result(self, trip: ActiveTrip, note: str) -> TripResult:
         """把这趟在途任务记成「没能送到」，用于归零/终局时补记录。"""

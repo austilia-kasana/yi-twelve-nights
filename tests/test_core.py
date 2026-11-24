@@ -1192,6 +1192,72 @@ class TestSettlementIntegrity(unittest.TestCase):
         self.assertEqual(arrived[0].events[0]["event"], "lost")
 
 
+
+    # ── 遇劫人马当夜也不能恢复 ──
+    def test_robbed_units_do_not_recover(self):
+        """遇劫 = 被打了一顿。当夜不该有休息加成。"""
+        gs = self._calm(GameState(seed=6))
+        gs.weather = "clear"
+        gs.forecast = "clear"
+        gs.night_progress = lambda *a, **k: 1.0
+        r, h = gs.available_riders()[0], gs.available_horses()[0]
+        r.stamina = 100.0
+        h.condition = 100.0
+        d = gs.dispatches[0]
+        d.route = "mine"
+        d.deadline = 9
+        gs.advance([(d, r, h)])              # 夜1 出发
+        st, co = r.stamina, h.condition
+        gs._roll_trip_event = lambda *a, **k: "robbery"
+        gs.advance([])                        # 夜2 遇劫
+        self.assertAlmostEqual(r.stamina, st, places=6,
+                               msg="遇劫当夜不该回体力")
+        self.assertAlmostEqual(h.condition, co, places=6,
+                               msg="遇劫当夜马不该回状态")
+
+    # ── 副作用顺序必须按 id ──
+    def test_side_effects_ordered_by_id(self):
+        """同夜「抵达」和「遇劫」并存时，id 小的先生效。
+
+        早先是阶段②遇劫立刻扣信、阶段③才结算抵达，于是遇劫永远先生效。
+        id 小的那封本该先送达，却因为 id 大的先遇劫把信扣光而被记成 aborted。
+        """
+        from relay.core.models import id_key
+        gs = GameState(seed=8)
+        gs.weather = "clear"
+        gs.forecast = "clear"
+        gs.night_progress = lambda *a, **k: 99.0
+        gs.gold = 10000
+        while len(gs.riders) < 2:
+            gs.hire_rider()
+        while len(gs.horses) < 2:
+            gs.buy_horse()
+        ds = gs.dispatches[:2]
+        for d in ds:
+            d.route = "north"
+            d.deadline = 1
+            d.penalty = 50
+        lo, hi = sorted(ds, key=id_key)
+        # id 大的遇劫，id 小的抵达
+        gs._roll_trip_event = lambda trip, w: (
+            "robbery" if trip.dispatch.id == hi.id else "calm")
+        gs.faith = 20
+        gs.advance([(ds[0], gs.riders[0], gs.horses[0]),
+                    (ds[1], gs.riders[1], gs.horses[1])])
+        by_id = {t.dispatch.id: t for t in gs.history[0].trips}
+        self.assertTrue(by_id[lo.id].delivered,
+                        "id 小的那封应该先结算并送达，不该被记成 aborted")
+        self.assertEqual(by_id[hi.id].event, "robbery")
+
+    # ── 遇劫受伤必须走 event_rng ──
+    def test_robbery_injury_uses_event_rng(self):
+        import inspect
+        src = inspect.getsource(GameState._resolve_robbery)
+        self.assertIn("self.event_rng", src)
+        self.assertNotIn("self.rng.random()", src,
+                         "遇劫受伤不该用主随机流")
+
+
 class TestEventSampling(unittest.TestCase):
     """真实事件抽样：概率换算和每夜口径必须对得上。"""
 
