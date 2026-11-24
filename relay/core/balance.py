@@ -142,6 +142,7 @@ HORSE_NATURAL_RECOVERY = 2.0
 #     p_night = 1 - (1 - p_trip) ** (1 / N)
 #
 # 这样 N 夜累计起来仍然约等于原来的 p_trip。见 sim._roll_trip_event()。
+# 权重表原本按「每趟一次」标定；在途模型下**每夜抽一次**。
 EVENTS = {
     "tailwind": {"name": "顺风", "weight": 8,  "desc": "风在背后推着走"},
     "lost":     {"name": "迷路", "weight": 10, "desc": "雾里绕了半宿"},
@@ -164,7 +165,10 @@ EVENTS = {
 EVENT_EFFECTS = {
     "tailwind": {"progress_mult": 2.0,  "distance_add": 0.0, "abort": False},
     "lost":     {"progress_mult": 0.5,  "distance_add": 0.0, "abort": False},
-    "rockfall": {"progress_mult": 0.0,  "distance_add": 1.0, "abort": False},
+    # 落石只保留「这一夜白走」，不再叠加「距离 +1」。
+    # 双重惩罚会让出发当夜就吃落石的任务直接失去 20% 距离 + 一整夜，
+    # 实测送达率只有 16%——那不是「麻烦」，是判死。
+    "rockfall": {"progress_mult": 0.0,  "distance_add": 0.0, "abort": False},
     "robbery":  {"progress_mult": 0.0,  "distance_add": 0.0, "abort": True},
 }
 
@@ -175,6 +179,14 @@ ROBBERY_CONDITION = {"weather": "storm", "mult": 2.0}
 # 换算时用的行程夜数下限。就算是「一夜任务」也要按一夜算，
 # 否则 1/N 会除出大于 1 的指数。
 EVENT_NIGHTS_MIN = 1.0
+
+# 各路线在「典型天气」下的平均速度系数。
+# 用来算**期望行程夜数**，作为事件概率换算的基数。
+#
+# 为什么不用出发时的乐观估计：出发时 `travel_nights()` 假设当晚天气持续，
+# 得到的是最短路。但实际行程 14% 会走成 3 夜、2% 走成 4 夜——
+# 按乐观值换算会让长途的累计事故率超标（Gemini 提、龙娘采纳）。
+EXPECTED_ROUTE_FACTOR = {"north": 0.785, "ford": 0.871, "mine": 1.000}
 
 # 遇劫后骑手受伤的概率（比正常抵达失败更高——是被打的）
 ROBBERY_INJURY_CHANCE = 0.40

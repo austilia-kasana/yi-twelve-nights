@@ -164,7 +164,8 @@ class ActiveTrip:
     elapsed_nights: int = 0
     due_night: int = 1         # 绝对夜数 = depart_night + deadline - 1
     light_factor: float = 1.0  # 出发时锁定，整趟不变
-    planned_nights: int = 1    # 出发时的行程估计，用于事件概率换算
+    planned_nights: int = 1    # 出发时的最优行程估计（仅参考）
+    expected_nights: int = 1   # 按典型天气的期望行程，事件概率换算用它
     events: list = field(default_factory=list)
     id: str = field(default_factory=lambda: _next_id("t"))
 
@@ -196,6 +197,7 @@ class ActiveTrip:
             "due_night": self.due_night,
             "light_factor": self.light_factor,
             "planned_nights": self.planned_nights,
+            "expected_nights": self.expected_nights,
             "events": list(self.events),
         }
 
@@ -213,6 +215,7 @@ class ActiveTrip:
             due_night=int(d.get("due_night", 1)),
             light_factor=float(d.get("light_factor", 1.0)),
             planned_nights=int(d.get("planned_nights", 1)),
+            expected_nights=int(d.get("expected_nights", d.get("planned_nights", 1))),
             events=list(d.get("events") or []),
             id=d.get("id", _next_id("t")),
         )
@@ -230,6 +233,7 @@ class TripResult:
     lost: bool                 # 信件彻底丢失（遇劫）
     event: str = "calm"        # 事件 key
     note: str = ""
+    events: list = field(default_factory=list)   # 整趟经历了哪些事件
 
     def to_dict(self) -> dict:
         return {
@@ -238,6 +242,7 @@ class TripResult:
             "route": self.route, "nights_taken": self.nights_taken,
             "delivered": self.delivered, "lost": self.lost,
             "event": self.event, "note": self.note,
+            "events": list(self.events),
         }
 
     @classmethod
@@ -252,6 +257,7 @@ class TripResult:
             lost=bool(d.get("lost", False)),
             event=d.get("event", "calm"),
             note=d.get("note", ""),
+            events=list(d.get("events") or []),
         )
 
 

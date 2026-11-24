@@ -1017,8 +1017,12 @@ class TestPerNightEvents(unittest.TestCase):
         base.advance([(d2, r2, h2)])
         self.assertLess(gs.trips[0].progress, base.trips[0].progress)
 
-    def test_rockfall_adds_distance(self):
-        """落石：本夜进度归零 + 该任务距离 +1。"""
+    def test_rockfall_only_one_penalty(self):
+        """落石只惩罚一项：本夜进度归零，**不再额外加距离**。
+
+        双重惩罚（归零 + 距离 +1）会让出发当夜就吃落石的任务直接失去
+        一整夜 + 20% 距离，实测送达率只有 16%——那不是麻烦，是判死。
+        """
         gs = GameState(seed=1)
         d, r, h = self._trip(gs, route="mine", deadline=5, per_night=1.2)
         dist_before = float(gs.route_distance["mine"])
@@ -1026,8 +1030,8 @@ class TestPerNightEvents(unittest.TestCase):
         gs.advance([(d, r, h)])
         trip = gs.trips[0]
         self.assertAlmostEqual(trip.progress, 0.0, places=6, msg="落石当夜不该推进")
-        self.assertAlmostEqual(trip.distance, dist_before + 1.0, places=6,
-                               msg="落石应该让路变长")
+        self.assertAlmostEqual(trip.distance, dist_before, places=6,
+                               msg="落石不该再加距离（只惩罚一项）")
 
     def test_robbery_ends_trip_and_costs_faith(self):
         """遇劫：任务立即终止，信丢，扣一半罚款，人马下一夜归队。"""
@@ -1061,6 +1065,194 @@ class TestPerNightEvents(unittest.TestCase):
                 continue
             self.assertIn(k, BB.EVENT_EFFECTS,
                           "事件 %s 没有定义每夜效果" % k)
+
+
+class TestSettlementIntegrity(unittest.TestCase):
+    """龙娘 v0.4.0 裁决定的「结算正确性」——任务不能丢、资源不能提前恢复。"""
+
+    def _calm(self, gs):
+        gs._roll_trip_event = lambda *a, **k: "calm"
+        return gs
+
+    # ── 信归零时已抵达但未结算的任务不能消失 ──
+    def test_arrived_but_unsettled_are_recorded(self):
+        gs = self._calm(GameState(seed=1))
+        gs.weather = "clear"
+        gs.forecast = "clear"
+        gs.night_progress = lambda *a, **k: 99.0
+        gs.gold = 10000
+        while len(gs.riders) < 3:
+            gs.hire_rider()
+        while len(gs.horses) < 3:
+            gs.buy_horse()
+        gs.faith = 3
+        ds = gs.dispatches[:3]
+        for d in ds:
+            d.route = "north"
+            d.deadline = 0        # 必然超期，第一封失败就把信打到 0
+            d.penalty = 5
+        gs.advance([(ds[0], gs.riders[0], gs.horses[0]),
+                    (ds[1], gs.riders[1], gs.horses[1]),
+                    (ds[2], gs.riders[2], gs.horses[2])])
+        nr = gs.history[0]
+        self.assertEqual(len(nr.trips), 3,
+                         "已抵达但没轮到结算的任务也必须留下记录")
+        aborted = [t for t in nr.trips if t.event == "aborted"]
+        self.assertEqual(len(aborted), 2)
+
+    # ── 第十二夜罚款把信打到 0 之后不能再判存活 ──
+    def test_final_night_penalty_can_lose_the_game(self):
+        gs = self._calm(GameState(seed=2))
+        gs.weather = "clear"
+        gs.forecast = "clear"
+        gs.night_progress = lambda *a, **k: 0.1     # 走不完
+        gs.night = B.TOTAL_NIGHTS
+        gs.faith = 3
+        d = gs.dispatches[0]
+        d.route = "mine"
+        d.deadline = 3
+        d.penalty = 8
+        r, h = gs.available_riders()[0], gs.available_horses()[0]
+        gs.advance([(d, r, h)])
+        self.assertEqual(gs.faith, 0)
+        self.assertFalse((gs.result or {}).get("survived"),
+                         "信被最终罚款打到 0，不能判「守住了」")
+
+    # ── 抵达当夜人马不能恢复 ──
+    def test_no_recovery_on_arrival_night(self):
+        gs = self._calm(GameState(seed=3))
+        gs.weather = "clear"
+        gs.forecast = "clear"
+        gs.night_progress = lambda *a, **k: 2.5     # 两夜任务
+        r, h = gs.available_riders()[0], gs.available_horses()[0]
+        r.stamina = 100.0
+        h.condition = 100.0
+        d = gs.dispatches[0]
+        d.route = "north"
+        d.deadline = 9
+        gs.advance([(d, r, h)])
+        st, co = r.stamina, h.condition
+        gs.advance([])                               # 抵达
+        self.assertAlmostEqual(r.stamina, st, places=6,
+                               msg="抵达当夜不该回体力（应下一夜才回）")
+        self.assertAlmostEqual(h.condition, co, places=6,
+                               msg="抵达当夜马不该回状态")
+
+    # ── 三类结果统一按 id 排序 ──
+    def test_settlement_order_is_unified_by_id(self):
+        from relay.core.models import id_key
+        gs = GameState(seed=4)
+        gs.weather = "clear"
+        gs.forecast = "clear"
+        gs.night_progress = lambda *a, **k: 99.0
+        gs.gold = 10000
+        while len(gs.riders) < 2:
+            gs.hire_rider()
+        while len(gs.horses) < 2:
+            gs.buy_horse()
+        ds = gs.dispatches[:2]
+        for d in ds:
+            d.route = "north"
+            d.deadline = 1
+        victim = max(ds, key=id_key)          # id 较大的那封遇劫
+        gs._roll_trip_event = lambda trip, w: (
+            "robbery" if trip.dispatch.id == victim.id else "calm")
+        gs.advance([(ds[0], gs.riders[0], gs.horses[0]),
+                    (ds[1], gs.riders[1], gs.horses[1])])
+        ids = [t.dispatch.id for t in gs.history[0].trips]
+        self.assertEqual(ids, sorted(ids, key=id_key),
+                         "遇劫和抵达必须统一按 id 排序")
+
+    # ── TripResult 必须带事件历史 ──
+    def test_trip_result_keeps_event_history(self):
+        gs = GameState(seed=5)
+        gs.weather = "clear"
+        gs.forecast = "clear"
+        gs.night_progress = lambda *a, **k: 1.0
+        seq = ["lost", "calm", "calm", "calm", "calm", "calm"]
+        idx = {"i": 0}
+
+        def roll(trip, w):
+            i = idx["i"]
+            idx["i"] = min(i + 1, len(seq) - 1)
+            return seq[i]
+        gs._roll_trip_event = roll
+        r, h = gs.available_riders()[0], gs.available_horses()[0]
+        d = gs.dispatches[0]
+        d.route = "mine"
+        d.deadline = 9
+        gs.advance([(d, r, h)])
+        for _ in range(10):
+            if not gs.trips or gs.over:
+                break
+            gs.advance([])
+        arrived = [t for nr in gs.history for t in nr.trips]
+        self.assertTrue(arrived)
+        self.assertTrue(arrived[0].events, "结算后的事件历史不能丢")
+        self.assertEqual(arrived[0].events[0]["event"], "lost")
+
+
+class TestEventSampling(unittest.TestCase):
+    """真实事件抽样：概率换算和每夜口径必须对得上。"""
+
+    @staticmethod
+    def _sample(n_games=200, route="mine", per_night=1.0, deadline=9):
+        from collections import Counter
+        from relay.core.sim import GameState as GS
+        counts = Counter()
+        nights = 0
+        for seed in range(n_games):
+            gs = GS(seed=seed)
+            gs.weather = "clear"
+            gs.forecast = "clear"
+            gs.night_progress = lambda *a, **k: per_night
+            r, h = gs.available_riders()[0], gs.available_horses()[0]
+            d = gs.dispatches[0]
+            d.route = route
+            d.deadline = deadline
+            gs.advance([(d, r, h)])
+            trip = gs.trips[0] if gs.trips else None
+            if trip is None:
+                continue
+            n_exp = trip.expected_nights
+            for _ in range(n_exp):
+                if not gs.trips:
+                    break
+                counts[gs._roll_trip_event(gs.trips[0], "clear")] += 1
+                nights += 1
+        return counts, nights
+
+    def test_per_night_rate_matches_conversion(self):
+        """每夜事故率应接近 1-(1-p_trip)^(1/N)，而不是 p_trip。"""
+        counts, nights = self._sample()
+        self.assertGreater(nights, 100, "样本太小")
+        any_event = sum(v for k, v in counts.items() if k != "calm") / nights
+        from relay.core import balance as BB
+        raw = {k: v["weight"] for k, v in BB.EVENTS.items()}
+        total = sum(raw.values())
+        p_trip = sum(v for k, v in raw.items() if k != "calm") / total
+        # 期望每夜率（按期望行程 2 夜算）
+        p_expect = 1 - (1 - p_trip) ** (1 / 2.0)
+        self.assertLess(abs(any_event - p_expect), 0.06,
+                        "实测每夜率 %.3f，期望 %.3f" % (any_event, p_expect))
+        # 必须明显低于每趟率——那才说明换算生效了
+        self.assertLess(any_event, p_trip,
+                        "每夜率不低于每趟率，说明没做换算")
+
+    def test_event_rng_is_separate_from_main_rng(self):
+        """事件流和主随机流必须独立。
+
+        否则「关掉事件」做 A/B 时整局随机轨迹都会变，测出的差异
+        分不清是事件效果还是随机流错位。
+        """
+        a = GameState(seed=7)
+        b = GameState(seed=7)
+        # 在 a 上狂抽事件随机数
+        for _ in range(50):
+            a.event_rng.random()
+        # 主随机流不该受影响
+        for _ in range(10):
+            self.assertAlmostEqual(a.rng.random(), b.rng.random(), places=12)
 
 
 if __name__ == "__main__":

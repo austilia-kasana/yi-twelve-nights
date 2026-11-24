@@ -137,6 +137,7 @@ def main() -> int:
     print()
     print("④ 读档后在途任务继续推进并正常抵达")
     back.night_progress = lambda *a, **k: 5.0    # 下一夜一定到
+    back._roll_trip_event = lambda *a, **k: "calm"  # 关事件，只验推进
     back.advance([])
     arrived = len(back.history[-1].trips) if back.history else 0
     print("   推进一夜后结算 %d 封  在途剩 %d 支  %s" % (

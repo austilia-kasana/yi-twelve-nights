@@ -50,7 +50,16 @@ class GameState:
     # ────────────────────── 构造 ──────────────────────
     def __init__(self, seed: Optional[int] = None):
         self.seed = seed
+        # 主随机流：信件生成、天气、受伤、采购
         self.rng = random.Random(seed)
+        # 独立的事件流。
+        #
+        # 为什么拆：事件的抽取次数随行程长度变化，如果和其他随机共用一条流，
+        # 「关掉事件」做 A/B 对比时整局的随机轨迹都会变——测出来的差异
+        # 就分不清是「事件的效果」还是「随机流错位」。
+        # 拆开之后，关掉事件不影响其余任何判定。
+        self.event_rng = random.Random(
+            None if seed is None else seed ^ 0x5EED_E7E17)
 
         self.night = 1
         # 信用整数。早先是 float，和日志里的 int 差量对不上（见 advance 里的说明）。
@@ -222,6 +231,22 @@ class GameState:
             return 99
         return max(1, int(math.ceil(dist / per)))
 
+    def expected_nights(self, dispatch: Dispatch, rider: Rider,
+                        horse: Horse, light_factor: Optional[float] = None) -> int:
+        """按**典型天气**估算这趟要走几夜。用于事件概率换算的基数。
+
+        和 travel_nights 的区别：travel_nights 用当晚实际/预报天气（最短路），
+        这个用路线在全局天气分布下的平均系数（预期路）。
+        """
+        dist = self.route_distance[dispatch.route]
+        wf = B.EXPECTED_ROUTE_FACTOR.get(dispatch.route, 1.0)
+        light = self.current_light_factor() if light_factor is None else light_factor
+        per = (rider.effective_speed() * horse.effective_speed()
+               * wf * light * B.BASE_TRAVEL)
+        if per <= 0.01:
+            return 99
+        return max(1, int(math.ceil(dist / per)))
+
     def night_progress(self, route: str, rider: Rider, horse: Horse,
                        weather: Optional[str] = None,
                        light_factor: Optional[float] = None) -> float:
@@ -262,7 +287,8 @@ class GameState:
         raw["calm"] = max(20.0, raw["calm"] * (1.0 - risk))
 
         total = sum(raw.values())
-        n = max(B.EVENT_NIGHTS_MIN, float(trip.planned_nights))
+        # 换算基数用**期望行程**，不是出发时的乐观估计。
+        n = max(B.EVENT_NIGHTS_MIN, float(trip.expected_nights))
 
         # 逐项换算成每夜概率
         probs = {}
@@ -275,11 +301,11 @@ class GameState:
         p_any = sum(probs.values())
         if p_any <= 0:
             return "calm"
-        if self.rng.random() >= p_any:
+        if self.event_rng.random() >= p_any:
             return "calm"
 
         # 在「发生事件」的前提下按相对概率挑一个
-        r = self.rng.random() * p_any
+        r = self.event_rng.random() * p_any
         acc = 0.0
         for k, p in probs.items():
             acc += p
@@ -400,8 +426,10 @@ class GameState:
                 elapsed_nights=0,
                 due_night=self.night + d.deadline - 1,
                 light_factor=light,
-                # 出发时的行程估计，给事件概率换算用
+                # 出发时的行程估计（最优），只作参考
                 planned_nights=self.travel_nights(d, r, h, weather, light),
+                # 事件概率换算用的**期望**行程：按典型天气系数算，不是最短路
+                expected_nights=self.expected_nights(d, r, h, light),
             ))
 
         # 拒收的信（本夜清单里没被派出去的那些）
@@ -436,6 +464,7 @@ class GameState:
             trip.elapsed_nights += 1
 
         # 遇劫：任务立即终止，人马下一夜归队（信丢了）
+        robbery_results = []
         for trip in robbed:
             if trip in self.trips:
                 self.trips.remove(trip)
@@ -445,7 +474,7 @@ class GameState:
             rob_pen = max(1, trip.dispatch.penalty // 2)
             self.faith = _clamp(old - rob_pen, 0, B.MAX_FAITH)
             result.faith_delta += self.faith - old
-            result.trips.append(TripResult(
+            tr = TripResult(
                 dispatch=trip.dispatch,
                 rider_name=rider.name if rider else "?",
                 horse_name=horse.name if horse else "?",
@@ -453,25 +482,44 @@ class GameState:
                 nights_taken=trip.elapsed_nights,
                 delivered=False, lost=True, event="robbery",
                 note="遇劫，信没了。",
-            ))
+                events=list(trip.events),
+            )
             # 遇劫的人更容易受伤
             if rider is not None and rider.state == "idle":
                 if self.rng.random() < B.ROBBERY_INJURY_CHANCE:
                     rider.state = "injured"
                     rider.injured_nights = self.rng.randint(1, 3)
                     injured_tonight.add(rider.id)
-                    result.trips[-1].note += " 骑手受了伤。"
+                    tr.note += " 骑手受了伤。"
+            robbery_results.append(tr)
 
         # ── ③ 统一结算抵达 ──
+        #
+        # 遇劫的结果在阶段②就已经产生了，抵达的结果在这里产生。
+        # 如果先后 append，同一夜的结果顺序就取决于「哪个阶段先跑」，
+        # 而不是 id。所以这里把三类结果**先收集、再按 id 排序、最后统一写入**。
+        pending = list(robbery_results)
+
         arrived = [t for t in self.trips if t.arrived()]
         arrived.sort(key=id_key)
 
-        revoked = False
+        # 本夜归队的人马——他们**当夜不恢复**，下一夜才开始恢复和重新派遣
+        returned_tonight: set = set()
+
         for trip in arrived:
+            returned_tonight.add(trip.rider_id)
+            returned_tonight.add(trip.horse_id)
             if self.faith <= 0:
-                revoked = True
-                break
-            self._resolve_arrival(trip, result, injured_tonight)
+                # 已经判定失败：这趟不能再结算，但**必须留下记录**，
+                # 否则它会从 history 里凭空消失、送达率分母也少算。
+                pending.append(self._aborted_result(
+                    trip, "驿被撤了，这封信没能送到。"))
+                continue
+            pending.append(self._resolve_arrival(trip, result, injured_tonight))
+
+        # 统一按 id 排序后写入。三类结果（遇劫 / 抵达 / 终止）不再分先后。
+        pending.sort(key=lambda t: id_key(t.dispatch))
+        result.trips.extend(pending)
 
         # 已抵达的都从在途列表移除
         arrived_ids = {t.id for t in arrived}
@@ -488,25 +536,19 @@ class GameState:
             left = list(self.trips)
             self.trips.clear()
             for trip in sorted(left, key=id_key):
-                rider = self.rider_by_id(trip.rider_id)
-                horse = self.horse_by_id(trip.horse_id)
-                result.trips.append(TripResult(
-                    dispatch=trip.dispatch,
-                    rider_name=rider.name if rider else "?",
-                    horse_name=horse.name if horse else "?",
-                    route=trip.route,
-                    nights_taken=trip.elapsed_nights,
-                    delivered=False,
-                    lost=False,
-                    event="aborted",
-                    note="驿被撤了，这封信没能送到。",
-                ))
+                result.trips.append(
+                    self._aborted_result(trip, "驿被撤了，这封信没能送到。"))
             if left:
                 self.note("信已见底，驿被撤了。还有 %d 支队伍在路上。" % len(left), "end")
 
-        # 休息：本夜没被指派、没受伤、也不在路上的骑手
+        # 休息：本夜没被指派、没受伤、不在路上、**也不是今夜刚归队的**
+        #
+        # 「刚归队」这一条是关键：抵达当夜人马仍算占用，下一夜才恢复。
+        # 早先只挡了「本夜被指派的人」（seen_r），跨夜抵达的人不在 seen_r 里，
+        # 于是抵达当夜就白拿了一份休息加成——等于路上跑一趟还倒赚体力。
         for r in self.riders:
             if (r.state == "idle" and r.id not in seen_r
+                    and r.id not in returned_tonight
                     and not self.is_busy(rider_id=r.id)):
                 r.stamina = _clamp(r.stamina + B.REST_STAMINA_GAIN, 0, 100)
 
@@ -519,9 +561,11 @@ class GameState:
                     r.injured_nights = 0
                     self.note("%s 的伤好了。" % r.name)
 
-        # 马每夜自然恢复——只给「今晚没出勤、也不在路上」的。
+        # 马每夜自然恢复——只给「今晚没出勤、不在路上、也不是今夜刚归队」的。
         for h in self.horses:
-            if h.id not in seen_h and not self.is_busy(horse_id=h.id):
+            if (h.id not in seen_h
+                    and h.id not in returned_tonight
+                    and not self.is_busy(horse_id=h.id)):
                 if h.condition < 100:
                     h.condition = _clamp(h.condition + B.HORSE_NATURAL_RECOVERY, 0, 100)
 
@@ -546,12 +590,30 @@ class GameState:
             # 为什么不能「不扣罚」：那是个免费期权——最后一夜把所有人马
             # 撒出去，成功拿赏、失败不亏。
             self._settle_unfinished_on_final_night(result)
-            self._finish(True, None)
+            # 最终罚款可能把信打到 0。那种情况是失败，不是「守住了」。
+            if self.faith <= 0:
+                self._finish(False, "驿被撤了。")
+            else:
+                self._finish(True, None)
         else:
             self.night += 1
             self.begin_night()
 
         return result
+
+    def _aborted_result(self, trip: ActiveTrip, note: str) -> TripResult:
+        """把这趟在途任务记成「没能送到」，用于归零/终局时补记录。"""
+        rider = self.rider_by_id(trip.rider_id)
+        horse = self.horse_by_id(trip.horse_id)
+        return TripResult(
+            dispatch=trip.dispatch,
+            rider_name=rider.name if rider else "?",
+            horse_name=horse.name if horse else "?",
+            route=trip.route,
+            nights_taken=trip.elapsed_nights,
+            delivered=False, lost=False, event="aborted",
+            note=note, events=list(trip.events),
+        )
 
     def _settle_unfinished_on_final_night(self, result: NightResult):
         """十二夜结束仍未抵达的任务。
@@ -572,22 +634,13 @@ class GameState:
             self.faith = _clamp(old - d.penalty, 0, B.MAX_FAITH)
             result.faith_delta += self.faith - old
 
-            result.trips.append(TripResult(
-                dispatch=d,
-                rider_name=rider.name if rider else "?",
-                horse_name=horse.name if horse else "?",
-                route=trip.route,
-                nights_taken=trip.elapsed_nights,
-                delivered=False,
-                lost=False,
-                event="unfinished",
-                note="信还在路上，十二夜就结束了。",
-            ))
+            result.trips.append(
+                self._aborted_result(trip, "信还在路上，十二夜就结束了。"))
         self.note("十二夜到了，还有 %d 支队伍在路上。" % len(left), "end")
 
     # ────────────────────── 抵达结算 ──────────────────────
     def _resolve_arrival(self, trip: ActiveTrip, result: NightResult,
-                         injured_tonight: set):
+                         injured_tonight: set) -> TripResult:
         """一支队伍走到了。判定送达/超时，扣赏罚，可能受伤。
 
         期限规则（定案）：期限决定信件能否成功，**不决定任务什么时候结束**。
@@ -631,8 +684,8 @@ class GameState:
             lost=False,
             event="calm",
             note=(event_note + " " + outcome_note).strip() if event_note else outcome_note,
+            events=list(trip.events),
         )
-        result.trips.append(trip_result)
 
         # 抵达时受伤：变 injured，当夜不减倒计时
         if not delivered and self.rng.random() < 0.15:
@@ -640,6 +693,8 @@ class GameState:
             rider.injured_nights = self.rng.randint(1, 2)
             injured_tonight.add(rider.id)
             trip_result.note += " 骑手受了伤。"
+
+        return trip_result
 
     def log_trips(self, result: NightResult):
         for t in result.trips:
@@ -729,6 +784,9 @@ class GameState:
         h = self.horse_by_id(horse_id)
         if h is None or self.gold < cost:
             return False
+        # 在路上喂不了。这条必须在核心层挡，不能只靠 UI。
+        if self.is_busy(horse_id=horse_id):
+            return False
         self.gold -= cost
         h.condition = _clamp(h.condition + B.FEED_CONDITION_GAIN, 0, 100)
         self.note("给 %s 喂了料。" % h.name)
@@ -799,6 +857,7 @@ class GameState:
             "log": self.log[-100:],
             "history": [nr.to_dict() for nr in self.history[-12:]],
             "rng_state": repr(self.rng.getstate()),
+            "event_rng_state": repr(self.event_rng.getstate()),
             "used_names": sorted(self._used_names),
             "used_horse_names": sorted(self._used_horse_names),
         }
@@ -826,6 +885,18 @@ class GameState:
             except (ValueError, SyntaxError):
                 # 随机状态坏了不至于让存档作废，只是这局不再可复现
                 gs.rng.seed(0 if gs.seed is None else gs.seed)
+
+        # 事件随机流独立，单独恢复。
+        # 旧存档（v3 之前）没有这个字段：用同样的派生规则重建，
+        # 不追求和旧局完全一致——旧局本来就没有这个流。
+        gs.event_rng = random.Random()
+        seed = gs.seed
+        gs.event_rng.seed(None if seed is None else seed ^ 0x5EED_E7E17)
+        if d.get("event_rng_state"):
+            try:
+                gs.event_rng.setstate(ast.literal_eval(d["event_rng_state"]))
+            except (ValueError, SyntaxError):
+                pass
 
         gs.night = int(d.get("night", 1))
         gs.faith = int(d.get("faith", B.START_FAITH))

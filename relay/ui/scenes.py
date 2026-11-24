@@ -266,8 +266,10 @@ class PlayScene:
             ("horse", W.Button((x, y + 104, 250, 34),
                                "买一匹马", size=13), B.PRICES["buy_horse"]),
         ]
-        # 喂料按钮：每个马一个
+        # 喂料按钮：每个马一个。在途的马不给喂——按钮直接不放出来。
         for i, h in enumerate(gs.horses[:4]):
+            if gs.is_busy(horse_id=h.id):
+                continue
             self.shop_btns.append(
                 ("feed:" + h.id, W.Button((x, y + 170 + i * 40, 250, 32),
                                           "喂 %s" % h.name, size=12),
@@ -356,6 +358,14 @@ class PlayScene:
         did = self.selected_dispatch
         if not did:
             self.toast.show("先点一封信。", "warn")
+            return
+        # 在路上的人马不能派。核心层也会挡，这里先给个明白的提示。
+        gs0 = self.gs
+        if what == "rider" and gs0.is_busy(rider_id=oid):
+            self.toast.show("这个人还在路上。", "warn")
+            return
+        if what == "horse" and gs0.is_busy(horse_id=oid):
+            self.toast.show("这匹马还在路上。", "warn")
             return
         cur = self.plan.get(did, (None, None))
         r, h = cur
@@ -622,10 +632,17 @@ class PlayScene:
         y += 22
         for i, r in enumerate(gs.riders):
             used = any(rr == r.id for rr, _ in self.plan.values())
+            away = gs.is_busy(rider_id=r.id)
             rect = pygame.Rect(x, y, 220, 56)
             self.rider_rects.append((rect, r.id))
+            prog = ""
+            if away:
+                t = gs.trip_of_rider(r.id)
+                if t is not None:
+                    prog = "在途 %d%%" % int(t.ratio * 100)
             self._draw_unit(surf, rect, r.name, r.speed, r.stamina,
-                            r.state, used, "rider", self._portrait_for(r, i))
+                            r.state, used, "rider", self._portrait_for(r, i),
+                            away=away, away_text=prog)
             y += 62
 
         y += 6
@@ -633,17 +650,25 @@ class PlayScene:
         y += 22
         for i, hh in enumerate(gs.horses):
             used = any(hid == hh.id for _, hid in self.plan.values())
+            away = gs.is_busy(horse_id=hh.id)
             rect = pygame.Rect(x, y, 220, 56)
             self.horse_rects.append((rect, hh.id))
+            prog = ""
+            if away:
+                t = gs.trip_of_horse(hh.id)
+                if t is not None:
+                    prog = "在途 %d%%" % int(t.ratio * 100)
             self._draw_unit(surf, rect, hh.name, hh.speed, hh.condition,
-                            "idle", used, "horse", self._horseportrait_for(hh, i))
+                            "idle", used, "horse", self._horseportrait_for(hh, i),
+                            away=away, away_text=prog)
             y += 62
 
         # 休息提示。早先「什么都不派 = 休息」这件事只写在 GDD 里，
         # 新玩家不会知道。压在背景上太淡，先垫一层半透明底再写字。
         resting = [r for r in gs.riders
-                   if r.state == "idle" and r.id not in
-                   {rr for rr, _ in self.plan.values()}]
+                   if r.state == "idle"
+                   and not gs.is_busy(rider_id=r.id)
+                   and r.id not in {rr for rr, _ in self.plan.values()}]
         hint_y = y + 4
         if hint_y < T.HEIGHT - 170:
             box = pygame.Rect(x - 6, hint_y - 4, 232, 36)
@@ -660,8 +685,8 @@ class PlayScene:
                    (x, hint_y + 16), size=11, color=T.SNOW_DIM)
 
     def _draw_unit(self, surf, rect, name, speed, meter, state, used, kind,
-                   portrait_id=None):
-        avail = (state == "idle") and not used
+                   portrait_id=None, away=False, away_text=""):
+        avail = (state == "idle") and not used and not away
         W.card(surf, rect, hi=avail and state == "idle",
                accent=T.LAMP_DIM if avail else None, alpha=225)
 
@@ -677,7 +702,7 @@ class PlayScene:
             thumb = thumb.copy()
             thumb.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
             surf.blit(thumb, (px, rect.y + 6))
-            if not avail:
+            if not avail or away:
                 ov = pygame.Surface(thumb.get_size(), pygame.SRCALPHA)
                 ov.fill((10, 16, 22, 150))
                 ov.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
@@ -696,7 +721,10 @@ class PlayScene:
         T.bar(surf, (tx, rect.y + 32, barw, 6), meter, 100, color=bcol)
         T.text(surf, "%d" % int(meter), (rect.right - 12, rect.y + 28), size=11,
                color=T.SNOW_DIM, anchor="topright")
-        if state == "injured":
+        if away:
+            T.text(surf, away_text or "在途", (rect.right - 12, rect.y + 42),
+                   size=11, color=T.LAMP, anchor="topright")
+        elif state == "injured":
             T.text(surf, "伤", (rect.right - 12, rect.y + 42), size=11,
                    color=T.BAD, anchor="topright")
         elif used:
