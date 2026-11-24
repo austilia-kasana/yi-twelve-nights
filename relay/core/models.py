@@ -125,6 +125,82 @@ class Assignment:
         }
 
 
+# ────────────────────────── 在途任务 ──────────────────────────
+@dataclass
+class ActiveTrip:
+    """一趟还在路上的运送。
+
+    这是「谁在途」的**唯一事实来源**：Rider 和 Horse 上都不存 out 状态，
+    可用性由 GameState 查这个列表得出。这样就不会出现「任务结束了但骑手
+    还挂着 out」这类状态不同步。
+
+    时间语义（见 docs/TRANSPORT.md 第 1 节）：
+        第 N 夜出发 → 当夜推进第一次
+        第 N+1 夜    → 推进第二次，抵达
+        第 N+2 夜    → 人马归队
+    """
+
+    dispatch: Dispatch
+    rider_id: str
+    horse_id: str
+    route: str
+    distance: float            # 出发时锁定（修路不影响已出发的任务）
+    progress: float = 0.0
+    depart_night: int = 1
+    elapsed_nights: int = 0
+    due_night: int = 1         # 绝对夜数 = depart_night + deadline - 1
+    light_factor: float = 1.0  # 出发时锁定，整趟不变
+    events: list = field(default_factory=list)
+    id: str = field(default_factory=lambda: _next_id("t"))
+
+    @property
+    def remaining(self) -> float:
+        return max(0.0, self.distance - self.progress)
+
+    @property
+    def ratio(self) -> float:
+        """走了几成。给 UI 用。"""
+        if self.distance <= 0:
+            return 1.0
+        return min(1.0, self.progress / self.distance)
+
+    def arrived(self) -> bool:
+        return self.progress >= self.distance
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "dispatch": self.dispatch.to_dict(),
+            "rider_id": self.rider_id,
+            "horse_id": self.horse_id,
+            "route": self.route,
+            "distance": self.distance,
+            "progress": self.progress,
+            "depart_night": self.depart_night,
+            "elapsed_nights": self.elapsed_nights,
+            "due_night": self.due_night,
+            "light_factor": self.light_factor,
+            "events": list(self.events),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ActiveTrip":
+        return cls(
+            dispatch=Dispatch.from_dict(d["dispatch"]),
+            rider_id=d["rider_id"],
+            horse_id=d["horse_id"],
+            route=d.get("route", "north"),
+            distance=float(d.get("distance", 1)),
+            progress=float(d.get("progress", 0.0)),
+            depart_night=int(d.get("depart_night", 1)),
+            elapsed_nights=int(d.get("elapsed_nights", 0)),
+            due_night=int(d.get("due_night", 1)),
+            light_factor=float(d.get("light_factor", 1.0)),
+            events=list(d.get("events") or []),
+            id=d.get("id", _next_id("t")),
+        )
+
+
 # ────────────────────────── 行进结果 ──────────────────────────
 @dataclass
 class TripResult:

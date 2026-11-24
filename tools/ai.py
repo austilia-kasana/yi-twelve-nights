@@ -64,10 +64,13 @@ class Strategy:
         信息约束：**只看 gs.forecast**，不看 gs.weather。
         这是整个模拟器的可信度基准——一旦这里读了实际天气，
         测出来的难度就比玩家实际面对的低。
+
+        在途模型下，可用性必须走 GameState 查询（骑手/马不能在路上），
+        不能只看 Rider.state——那是 v0.3.x 留下的坑。
         """
-        riders = [r for r in gs.riders if r.state == "idle"]
+        riders = gs.available_riders()
         ready = [r for r in riders if r.stamina >= self.rest_at]
-        horses = list(gs.horses)
+        horses = gs.available_horses()
 
         cands = []
         for d in gs.dispatches:
@@ -115,8 +118,10 @@ class Strategy:
                 if gs.feed(worst.id):
                     done.append("喂" + worst.name)
 
-        # 人不够就雇——人力才是真正的瓶颈
-        avail = len([r for r in gs.riders if r.state != "injured"])
+        # 人不够就雇——人力才是真正的瓶颈。
+        # 注意：这里要用 available_riders（排除在途），
+        # 不能用 state != "injured"——那会把在途的人也算成可用。
+        avail = len(gs.available_riders())
         if avail < self.hire_below and gs.gold >= B.PRICES["hire_rider"] + 80:
             r = gs.hire_rider()
             if r:
@@ -124,8 +129,8 @@ class Strategy:
                 return done
 
         # 马比骑手少就补马
-        idle_riders = len([r for r in gs.riders if r.state == "idle"])
-        if (len(gs.horses) < min(idle_riders, self.horse_cap)
+        usable = len(gs.available_horses())
+        if (usable < min(avail, self.horse_cap)
                 and gs.gold >= B.PRICES["buy_horse"] + 100):
             h = gs.buy_horse()
             if h:

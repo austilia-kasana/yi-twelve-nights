@@ -54,11 +54,13 @@ class TestDeterminism(unittest.TestCase):
     @staticmethod
     def _fast_plan(gs):
         """给最快的骑手配最快的马，只送一封最简单的事。"""
-        riders = [r for r in gs.riders if r.state == "idle"]
-        if not riders or not gs.horses:
+        # 只用真正可派的：没伤、且不在路上
+        riders = gs.available_riders()
+        horses = gs.available_horses()
+        if not riders or not horses:
             return []
         r = max(riders, key=lambda x: x.speed)
-        h = max(gs.horses, key=lambda x: x.speed)
+        h = max(horses, key=lambda x: x.speed)
         best = None
         for d in gs.dispatches:
             n = gs.travel_nights(d, r, h)
@@ -349,25 +351,34 @@ class TestRuleRegressions(unittest.TestCase):
             d.penalty = 5
         gs.advance([(gs.dispatches[0], gs.riders[0], gs.horses[0]),
                     (gs.dispatches[1], gs.riders[1], gs.horses[1])])
-        # 第一封就把信打到 0，第二封不该出去
-        self.assertEqual(len(gs.history[0].trips), 1)
+        # 两封都在夜初出发了（资源已扣）。第一封结算把信打到 0，
+        # 第二封被终止——但它仍然留下记录、计入分母，所以是 2 条。
+        self.assertEqual(len(gs.history[0].trips), 2)
         self.assertTrue(gs.over)
-        # 第二匹马没被用过，状态不该动
-        self.assertEqual(gs.horses[1].condition, 100)
+        aborted = [t for t in gs.history[0].trips if t.event == "aborted"]
+        self.assertEqual(len(aborted), 1, "被终止的那封应该标记为 aborted")
+        # 资源不退还：第二支队已经出发了，马的状态该扣
+        # （玩家是夜初决定派遣的，不能假装没派出去）
+        self.assertLess(gs.horses[1].condition, 100)
 
     # ── 信必须是整数，且和日志差额完全对得上 ──
     def test_faith_is_integer_and_deltas_add_up(self):
         gs = GameState(seed=7)
         start = gs.faith
-        total = 0
         for _ in range(6):
             if gs.over:
                 break
+            riders = gs.available_riders()
+            horses = gs.available_horses()
+            if not riders or not horses or not gs.dispatches:
+                gs.advance([])
+                continue
             d = gs.dispatches[0]
             d.kind = "urgent"
             d.deadline = 99
-            gs.advance([(d, gs.riders[0], gs.horses[0])])
-            total += gs.history[-1].faith_delta
+            gs.advance([(d, riders[0], horses[0])])
+        # 在途模型里，派出的信不一定当夜结算，所以要扫全量 history
+        total = sum(nr.faith_delta for nr in gs.history)
         self.assertIsInstance(gs.faith, int)
         self.assertEqual(gs.faith - start, total,
                          "最终信和逐夜差额之和不等")
@@ -384,29 +395,36 @@ class TestRuleRegressions(unittest.TestCase):
         for seed in range(200):
             gs = GameState(seed=seed)
             d = gs.dispatches[0]
-            d.deadline = 0
-            gs.advance([(d, gs.riders[0], gs.horses[0])])
-            if any("受了伤" in e["text"] for e in gs.log[-8:]):
+            d.route = "north"
+            d.deadline = 1
+            gs.night_progress = lambda *a, **k: 2.5   # 两夜才到，必然超期
+            riders = gs.available_riders()
+            horses = gs.available_horses()
+            r = riders[0]
+            gs.advance([(d, r, horses[0])])
+            gs.advance([])                             # 抵达
+            if any("受了伤" in e["text"] for e in gs.log[-10:]):
                 injured_count += 1
-                if gs.riders[0].state != "injured":
+                if r.state != "injured":
                     healed_same_night += 1
         self.assertGreater(injured_count, 10, "样本里没抽到受伤，测不动")
         self.assertEqual(healed_same_night, 0,
                          "%d 次受伤里有 %d 次当晚就好了" % (injured_count, healed_same_night))
 
     # ── 事件提示不得掩盖失败原因 ──
-    def test_event_note_does_not_mask_failure(self):
+    def test_late_arrival_reports_how_late(self):
+        """超期抵达时，日志要写清「晚了几夜」，而不是笼统一句「晚了一夜」。"""
         gs = GameState(seed=1)
         d = gs.dispatches[0]
-        d.route = "mine"
-        d.deadline = 1
-        gs.travel_nights = lambda *a, **k: 3        # 强制 3 夜 > 期限 1
-        gs._roll_event = lambda *a, **k: "tailwind"
+        d.route = "north"
+        d.deadline = 1                  # due_night = 出发夜
+        gs.night_progress = lambda *a, **k: 2.5   # 两夜才到
         gs.advance([(d, gs.riders[0], gs.horses[0])])
-        t = gs.history[0].trips[0]
+        gs.advance([])                  # 抵达
+        t = gs.history[-1].trips[0]
         self.assertFalse(t.delivered)
-        self.assertIn("顺风", t.note)               # 事件要在
-        self.assertIn("晚", t.note)                 # 失败原因也要在
+        self.assertIn("晚", t.note)
+        self.assertIn("1", t.note)      # 晚了几夜要说清
 
     # ── 出勤的马不得吃自然恢复 ──
     def test_working_horse_does_not_recover(self):
@@ -463,9 +481,10 @@ class TestSaveLoad(unittest.TestCase):
         for _ in range(nights):
             if gs.over:
                 break
-            riders = [r for r in gs.riders if r.state == "idle"]
-            if riders and gs.horses and gs.dispatches:
-                gs.advance([(gs.dispatches[0], riders[0], gs.horses[0])])
+            riders = gs.available_riders()
+            horses = gs.available_horses()
+            if riders and horses and gs.dispatches:
+                gs.advance([(gs.dispatches[0], riders[0], horses[0])])
             else:
                 gs.advance([])
         return gs
@@ -536,9 +555,10 @@ class TestV03Regressions(unittest.TestCase):
         for _ in range(nights):
             if gs.over:
                 break
-            riders = [r for r in gs.riders if r.state == "idle"]
-            if riders and gs.horses and gs.dispatches:
-                gs.advance([(gs.dispatches[0], riders[0], gs.horses[0])])
+            riders = gs.available_riders()
+            horses = gs.available_horses()
+            if riders and horses and gs.dispatches:
+                gs.advance([(gs.dispatches[0], riders[0], horses[0])])
             else:
                 gs.advance([])
         return gs
@@ -593,8 +613,8 @@ class TestV03Regressions(unittest.TestCase):
                          "撞到 0 下限时差额记错了")
 
     # ── ③ 归零后拒收索引 ──
-    def test_revoked_includes_the_blocking_dispatch(self):
-        """归零 break 掉的那一封自己也没出去，必须计入拒收。"""
+    def test_aborted_trips_are_recorded(self):
+        """信归零后未抵达的任务：资源不退，但必须留下记录、计入分母。"""
         gs = GameState(seed=1)
         gs.gold = 10000
         while len(gs.riders) < 3:
@@ -610,9 +630,11 @@ class TestV03Regressions(unittest.TestCase):
                     (ds[1], gs.riders[1], gs.horses[1]),
                     (ds[2], gs.riders[2], gs.horses[2])])
         nr = gs.history[0]
-        self.assertEqual(len(nr.trips), 1)
-        self.assertEqual(len(nr.dropped), 2,
-                         "少算了一封：索引应该从 revoked_at 而不是 revoked_at+1 开始")
+        # 三封都在夜初出发了（资源已扣），所以没有「拒收」
+        self.assertEqual(len(nr.dropped), 0, "三封都已派出，不该有拒收")
+        # 但被终止的在途任务必须留下记录
+        self.assertGreaterEqual(len(nr.trips), 2,
+                                "被终止的在途任务也要计入统计")
 
 
 class TestSaveVersioning(unittest.TestCase):
@@ -650,6 +672,173 @@ class TestSaveVersioning(unittest.TestCase):
             self.assertIsInstance(back.faith, int, "迁移后 faith 应该是整数")
         finally:
             SV.delete("slot2")
+
+
+class TestTransit(unittest.TestCase):
+    """在途运输模型（Phase B1）的核心规则。
+
+    规范见 docs/TRANSPORT.md。这些测试对应文档第 14 节的清单。
+    """
+
+    def _setup(self, route="north", deadline=None, per_night=None):
+        gs = GameState(seed=1)
+        gs.weather = "clear"
+        gs.forecast = "clear"
+        if per_night is not None:
+            gs.night_progress = lambda *a, **k: per_night
+        d = gs.dispatches[0]
+        d.route = route
+        if deadline is not None:
+            d.deadline = deadline
+        return gs, d, gs.available_riders(), gs.available_horses()
+
+    # ── 时间轴 ──
+    def test_one_night_trip_arrives_same_night(self):
+        """一夜任务：出发当夜抵达，次夜可用。"""
+        gs, d, riders, horses = self._setup("north", deadline=1, per_night=3.0)
+        r, h = riders[0], horses[0]
+        gs.advance([(d, r, h)])
+        self.assertEqual(len(gs.history[-1].trips), 1, "出发当夜就该抵达")
+        self.assertEqual(len(gs.trips), 0)
+        self.assertFalse(gs.is_busy(rider_id=r.id), "次夜应该能再用")
+
+    def test_two_night_trip_occupies_two_turns(self):
+        """两夜任务：出发次夜抵达，再下一夜可用。"""
+        gs, d, riders, horses = self._setup("north", deadline=2, per_night=2.5)
+        r, h = riders[0], horses[0]
+
+        gs.advance([(d, r, h)])
+        self.assertEqual(len(gs.history[-1].trips), 0, "当夜不该抵达")
+        self.assertEqual(len(gs.trips), 1, "应该在路上")
+        self.assertTrue(gs.is_busy(rider_id=r.id))
+        self.assertTrue(gs.is_busy(horse_id=h.id))
+
+        gs.advance([])
+        self.assertEqual(len(gs.history[-1].trips), 1, "次夜抵达")
+        self.assertFalse(gs.is_busy(rider_id=r.id), "抵达夜之后释放")
+
+    # ── 可用性 ──
+    def test_busy_rider_and_horse_not_available(self):
+        gs, d, riders, horses = self._setup("mine", deadline=3, per_night=1.0)
+        r, h = riders[0], horses[0]
+        gs.advance([(d, r, h)])
+        self.assertNotIn(r, gs.available_riders())
+        self.assertNotIn(h, gs.available_horses())
+        with self.assertRaises(ValueError):
+            gs.advance([(gs.dispatches[0], r, gs.available_horses()[0])])
+
+    # ── 在途不恢复 ──
+    def test_no_recovery_while_in_transit(self):
+        gs, d, riders, horses = self._setup("mine", deadline=3, per_night=1.0)
+        r, h = riders[0], horses[0]
+        r.stamina = 50
+        h.condition = 50
+        gs.advance([(d, r, h)])
+        st, co = r.stamina, h.condition
+        gs.advance([])
+        self.assertEqual(r.stamina, st, "在途骑手不该回体力")
+        self.assertEqual(h.condition, co, "在途马不该回状态")
+
+    # ── 灯火锁定 ──
+    def test_light_factor_locked_at_departure(self):
+        """出发时锁定的灯火系数，不因后续油量变化而改变。"""
+        gs, d, riders, horses = self._setup("mine", deadline=3, per_night=1.0)
+        r, h = riders[0], horses[0]
+        gs.oil = 100
+        gs.advance([(d, r, h)])
+        trip = gs.trips[0]
+        self.assertAlmostEqual(trip.light_factor, 1.0, places=5)
+        # 把油烧光，已出发的任务不应受影响
+        gs.oil = 0
+        self.assertEqual(gs.current_light_factor(), B.OIL_LIGHT_FACTOR)
+        self.assertAlmostEqual(trip.light_factor, 1.0, places=5)
+
+    # ── 天气每夜重算 ──
+    def test_weather_changes_progress(self):
+        """同样的出发条件，暴雪夜里推进更慢（矿道免疫除外）。"""
+        gs1 = GameState(seed=1)
+        gs1.weather = "clear"
+        p_clear = gs1.night_progress("ford", gs1.riders[0], gs1.horses[0])
+        gs2 = GameState(seed=1)
+        gs2.weather = "storm"
+        p_storm = gs2.night_progress("ford", gs2.riders[0], gs2.horses[0])
+        self.assertLess(p_storm, p_clear, "暴雪应该更慢")
+
+        # 矿道对天气免疫
+        gs3 = GameState(seed=1)
+        gs3.weather = "clear"
+        m_clear = gs3.night_progress("mine", gs3.riders[0], gs3.horses[0])
+        gs4 = GameState(seed=1)
+        gs4.weather = "storm"
+        m_storm = gs4.night_progress("mine", gs4.riders[0], gs4.horses[0])
+        self.assertAlmostEqual(m_clear, m_storm, places=5)
+
+    # ── 超期仍继续运输 ──
+    def test_late_trip_keeps_travelling(self):
+        """期限决定能否成功，**不决定任务什么时候结束**。"""
+        gs, d, riders, horses = self._setup("north", deadline=1, per_night=1.5)
+        r, h = riders[0], horses[0]
+        gs.advance([(d, r, h)])          # due_night = 出发夜，已经超期
+        self.assertEqual(len(gs.trips), 1, "超期了但人还在路上")
+        gs.advance([])                   # 第二夜抵达
+        t = gs.history[-1].trips[0]
+        self.assertFalse(t.delivered)
+        self.assertIn("晚", t.note)
+
+    # ── 修路不影响已出发 ──
+    def test_repair_does_not_affect_departed_trip(self):
+        gs, d, riders, horses = self._setup("mine", deadline=5, per_night=1.0)
+        r, h = riders[0], horses[0]
+        before = gs.route_distance["mine"]
+        gs.advance([(d, r, h)])
+        trip = gs.trips[0]
+        self.assertEqual(trip.distance, float(before))
+        gs.gold = 10000
+        gs.repair_route("mine")
+        self.assertEqual(trip.distance, float(before), "已出发的任务距离不该变")
+
+    # ── 同夜多队结算顺序无关 ──
+    def test_multi_trip_order_independent(self):
+        """同一夜多支队伍抵达，只换登记顺序，结果必须一致。"""
+        def run(reverse):
+            gs = GameState(seed=42)
+            gs.weather = "clear"
+            gs.forecast = "clear"
+            riders = gs.available_riders()[:2]
+            horses = gs.available_horses()[:2]
+            ds = gs.dispatches[:2]
+            for x in ds:
+                x.route = "north"
+                x.deadline = 1
+            gs.night_progress = lambda *a, **k: 3.0     # 当夜就都到
+            pairs = [(ds[0], riders[0], horses[0]),
+                     (ds[1], riders[1], horses[1])]
+            if reverse:
+                pairs = pairs[::-1]
+            gs.advance(pairs)
+            return sorted((t.rider_name, t.route, t.delivered)
+                          for t in gs.history[-1].trips)
+        self.assertEqual(run(False), run(True), "登记顺序影响了结算")
+
+    # ── 第十二夜未抵达 ──
+    def test_unfinished_on_last_night_is_counted(self):
+        """第十二夜仍在途 → 按未送达处理，计入分母。"""
+        gs = GameState(seed=1)
+        gs.night = B.TOTAL_NIGHTS
+        gs.weather = "clear"
+        gs.forecast = "clear"
+        gs.night_progress = lambda *a, **k: 1.0        # 走不完
+        riders = gs.available_riders()
+        horses = gs.available_horses()
+        d = gs.dispatches[0]
+        d.route = "mine"
+        d.deadline = 3
+        gs.advance([(d, riders[0], horses[0])])
+        self.assertTrue(gs.over)
+        nr = gs.history[-1]
+        # 派出去的那封必须计入分母
+        self.assertEqual(len(nr.trips), 1, "第十二夜未完成的信要计入统计")
+        self.assertFalse(nr.trips[0].delivered)
 
 
 if __name__ == "__main__":

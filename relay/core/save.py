@@ -21,7 +21,7 @@ from typing import Optional
 
 from .sim import GameState
 
-SAVE_VERSION = 2
+SAVE_VERSION = 3
 
 SLOTS = ("auto", "slot1", "slot2", "slot3")
 
@@ -99,6 +99,8 @@ def _migrate(d: dict, from_ver: int) -> Optional[dict]:
                  结构上已经是当前格式，直接放行。
     """
     if from_ver == 2:
+        # v2（0.3.x）没有在途任务；补一个空列表即可
+        d.setdefault("trips", [])
         d["version"] = SAVE_VERSION
         return d
     if from_ver == 1:
