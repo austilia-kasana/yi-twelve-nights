@@ -162,7 +162,21 @@ class SmartStrategy(Strategy):
        否则会出现「马买了、油没了、全队减速 35%」的净亏。
 
     3. **余量筛选**：`min_margin=1`。Round 0 数据显示零余量派单是亏损的。
+
+    ## 这个字段以前只写在文档里
+
+    v0.5.0 收尾时发现：上面第 3 条只写在 docstring 里，**类上没有这个字段**，
+    于是 `SmartStrategy()` 的 `min_margin` 一直是继承来的 0——等于「三条设计」
+    只实现两条。
+
+    后果不是小事：`docs/CHANGELOG.md`、`ISSUES.md`、`balance.py` 里那套
+    「500 局实测 达标 71.2% / S 27.2%」只有 `SmartStrategy(min_margin=1)`
+    才复现得出来；而仓库自带的 `tools/sim_balance.py` 走的是 `Strategy()`，
+    同一份代码跑出来是 达标 48% / S 16%。**同一份代码，两套数，没人发现。**
     """
+
+    # 文档里的第 3 条，现在真的在这里。改它之前先跑 sim_balance.py 看曲线。
+    min_margin: int = 1
 
     # 编制目标上限（只用于这个策略的买马判断）
     team_cap: int = 4

@@ -256,6 +256,17 @@ class TitleScene:
         self.btn_back.draw(surf)
 
 
+def repair_label(route_name: str, cur_distance: int) -> str:
+    """整备面板里「修路」按钮的文案。
+
+    早先写的是「修 北口（3→2 夜）」——但那两个数其实是**路程**
+    （`gs.route_distance`），不是夜数。北口走 1 夜还是 2 夜要看天气和脚力，
+    修完不保证少一夜。玩家照着「3→2 夜」去算余量，会算错。
+    所以老老实实写「路程」。
+    """
+    return "修 %s（路程 %d→%d）" % (route_name, cur_distance, cur_distance - 1)
+
+
 # ────────────────────────── 主界面 ──────────────────────────
 class PlayScene:
     def __init__(self, app, gs: GameState):
@@ -275,7 +286,11 @@ class PlayScene:
                                  "整备", kind="normal", size=13)
         self.btn_clear = W.Button((T.WIDTH - 210, T.HEIGHT - 156, 186, 30),
                                   "清空本夜", kind="ghost", size=12)
-        self.btn_menu = W.Button((T.WIDTH - 76, 16, 56, 30), "菜单", kind="ghost", size=12)
+        # 早先这个按钮叫「菜单」，点一下直接回标题页：什么都不问，
+        # 也不存档，一整局就这么丢了。既然它实际上就是「存盘退出」，
+        # 就照实叫这个名字，并且真的存一次盘。
+        self.btn_menu = W.Button((T.WIDTH - 104, 16, 84, 30), "存盘退出",
+                                 kind="ghost", size=12)
         self.show_shop = False
         self.shop_rect = pygame.Rect(0, 0, 1, 1)
         self.btn_shop_close = W.Button((0, 0, 30, 30), "×", kind="ghost", size=19)
@@ -325,7 +340,7 @@ class PlayScene:
             self.shop_btns.append(
                 ("repair:" + rk,
                  W.Button((x, y + 400, 250, 32),
-                          "修 %s（%d→%d 夜）" % (rd["name"], cur, cur - 1),
+                          repair_label(rd["name"], cur),
                           size=12),
                  rd["repair_cost"]))
 
@@ -365,6 +380,9 @@ class PlayScene:
                 self.toast.show("清空了 %d 条指派。" % n, "info")
             return
         if self.btn_menu.handle(ev):
+            # 先写自动存档，再回标题。写盘失败也照样回去（save_progress 返回 False），
+            # 但至少不会像以前那样——玩家以为按了菜单，回来发现进度没了。
+            self.app.save_progress()
             self.app.goto_title()
             return
 

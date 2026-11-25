@@ -208,13 +208,22 @@ class App:
 
     def _save_on_exit(self):
         """关窗口时存一次。一局 25 分钟，不能让人因为切窗口丢掉进度。"""
+        self.save_progress()
+
+    def save_progress(self):
+        """把当前进度写进自动存档。
+
+        三个地方要用：关窗口（QUIT / Alt+F4）、主界面「存盘退出」、
+        以及以后可能加的暂停菜单——所以抽出来，别再各写一份。
+        成功返回 True；没有局在打、或者已经结算、或者写盘失败都返回 False。
+        """
         if not self.gs or self.gs.over:
-            return
+            return False
         try:
             from ..core import save as SV
-            SV.save(self.gs, "auto")
+            return SV.save(self.gs, "auto") is not None
         except Exception:
-            pass
+            return False
 
     def _draw(self):
         buf = pygame.Surface((T.WIDTH, T.HEIGHT))

@@ -20,17 +20,27 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from relay.core import balance as B          # noqa: E402
-from ai import Strategy, run_many            # noqa: E402
+from ai import Strategy, SmartStrategy, run_many   # noqa: E402
+
+# 三种口径。**必须说清用的是哪一种**——v0.5.0 就栽在这上面：
+# 文档里的「达标 71.2%」是 smart 打出来的，而本工具当时写死 Strategy()，
+# 同一份代码跑出来 48%，两边各自都被当成「官方难度」用了几轮。
+STRATEGIES = {
+    "base": (Strategy, "会算余量、但不会算账（买马不保护油钱）"),
+    "smart": (SmartStrategy, "会算账 + 只接余量>=1 的信（docs 里那套数的口径）"),
+}
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("-n", "--num", type=int, default=200)
+    ap.add_argument("-s", "--strategy", default="smart", choices=sorted(STRATEGIES))
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--seed-offset", type=int, default=0)
     args = ap.parse_args(argv)
 
-    games = run_many(args.num, Strategy(), seed_offset=args.seed_offset)
+    strat_cls, strat_desc = STRATEGIES[args.strategy]
+    games = run_many(args.num, strat_cls(), seed_offset=args.seed_offset)
 
     # 「达标」= 守住了（信 >= SURVIVE_FAITH），不是「活到第 12 夜」。
     # 这两个差别很大：survived 只表示没被提前撤驿，而提前撤驿要求信掉到
@@ -55,6 +65,7 @@ def main(argv=None):
     print("=" * 62)
     print("平衡模拟   %d 局   种子 %d..%d" % (
         args.num, args.seed_offset, args.seed_offset + args.num - 1))
+    print("策略       %s —— %s" % (args.strategy, strat_desc))
     print("=" * 62)
     print()
     zero = sum(1 for g in games if g.faith <= 0)
